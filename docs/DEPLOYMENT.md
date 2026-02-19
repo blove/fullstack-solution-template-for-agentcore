@@ -85,7 +85,7 @@ cd infra-cdk
 npm install
 ```
 
-**Note**: Frontend dependencies are automatically installed during deployment via Docker bundling, so no separate frontend `npm install` is required.
+**Note**: Frontend dependencies are automatically installed during deployment via Docker bundling, so no separate frontend `npm install` is required. The CopilotKit Lambda (`infra-cdk/lambdas/copilotkit-runtime/`) is also bundled in Docker during `cdk deploy` (runs `npm ci` and `npm run build`), so no separate `npm install` in that directory is needed for deployment.
 
 ### 2. Bootstrap CDK (First Time Only)
 
@@ -122,9 +122,24 @@ python scripts/deploy-frontend.py
 This script automatically:
 
 - Generates fresh `aws-exports.json` from CDK stack outputs (see below for more information about `aws-exports.json`)
+- Reads `backend.pattern` from `infra-cdk/config.yaml` and resolves frontend path as `patterns/<backend.pattern>/frontend/`
 - Installs/updates npm dependencies if needed
 - Builds the Next.js frontend
 - Deploys to AWS Amplify Hosting
+
+### CopilotKit Runtime Backend
+
+CopilotKit is deployed as a standalone backend in CDK:
+
+- A Node.js Lambda in `infra-cdk/lambdas/copilotkit-runtime/`
+- A public API Gateway endpoint in front of that Lambda
+
+Lambda dependencies are installed and the TypeScript is built automatically during `cdk deploy` via Docker asset bundling (`npm ci` and `npm run build` in the Lambda directory). For local development (e.g. editing the Lambda or running `npm run build` locally), run `npm install` in `infra-cdk/lambdas/copilotkit-runtime/`.
+
+The frontend remains static (`output: "export"`). It does not use a Next.js API route like
+`/api/copilotkit`. Instead, `deploy-frontend.py` reads CloudFormation output `CopilotKitRuntimeUrl`
+and writes it to `aws-exports.json` as `copilotKitRuntimeUrl`. The CopilotKit layout reads this value
+client-side and sends CopilotKit traffic to the Lambda-backed API.
 
 You will see the URL for application in the script's output, which will look similar to this:
 
@@ -230,6 +245,15 @@ cdk destroy --force
    - Verify your AWS credentials have sufficient permissions
    - Check IAM roles created by the stack
 
+6. **CopilotKit `/copilotkit` returns 502 or 500 when sending a message**
+
+   The CopilotKit frontend calls API Gateway → Lambda → Bedrock AgentCore runtime (`/invocations`). A 502 usually means the Lambda threw or the upstream AgentCore/runtime returned an error.
+
+   - **Check Lambda logs first**: In CloudWatch, open the log group `/aws/lambda/{stack_name_base}-copilotkit-runtime`. Look for `[CopilotKit Lambda] Error:` and the message/stack. After the recent change, unhandled Lambda errors are caught and returned as 500 with a JSON body; the same message is logged here.
+   - **Authentication**: The AgentCore runtime is protected by a JWT authorizer (Cognito). The Lambda forwards the request `Authorization` header to the agent. Ensure you are signed in on the frontend so the browser sends the Cognito JWT. Requests without a valid token will get 401 from AgentCore (or the Lambda may log a fetch/upstream error).
+   - **Upstream 502**: If the Lambda does not log an error but the client still gets 502, the AgentCore runtime or your agent code may be failing. Check AgentCore runtime metrics and any runtime logs (e.g. CloudWatch log group for the runtime if applicable). Ensure the backend pattern (e.g. `langgraph-ag-ui-agent`) is deployed and the runtime is healthy.
+   - **Env/URL**: Confirm the Lambda has `AGENTCORE_AG_UI_URL` set (e.g. from CDK output). It should look like `https://bedrock-agentcore.{region}.amazonaws.com/runtimes/arn%3A.../invocations`.
+
 ### Getting Help
 
 - Check CloudWatch logs for detailed error messages
@@ -288,7 +312,7 @@ The `aws-exports.json` file is a critical configuration file that enables the Re
 
 **What is aws-exports.json?**
 
-The `aws-exports.json` file contains authentication configuration that the React application reads to properly configure Cognito Authentication. It's created automatically by the deployment script and placed in `frontend/public/aws-exports.json`.
+The `aws-exports.json` file contains authentication configuration that the React application reads to properly configure Cognito Authentication. It's created automatically by the deployment script and placed in `patterns/<backend.pattern>/frontend/public/aws-exports.json`.
 
 **Why is it necessary?**
 

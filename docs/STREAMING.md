@@ -8,8 +8,8 @@ Your agent sends streaming events in SSE format. This guide explains how to inte
 
 1. **Your agent sends streaming events** (SSE format)
 2. **Update the appropriate parser file** to handle your agent's events:
-   - For **Strands agents**: Modify `frontend/src/services/strandsParser.js`
-   - For **LangGraph agents**: Modify `frontend/src/services/langgraphParser.js`
+   - For **Strands agents**: Modify `patterns/<backend.pattern>/frontend/src/services/strandsParser.js`
+   - For **LangGraph agents**: Modify `patterns/<backend.pattern>/frontend/src/services/langgraphParser.js`
    - For **other agent frameworks**: Create a new parser file and import it in `agentCoreService.js`
 3. **Update `ChatInterface.tsx`** (optional) to display additional info like tool usage
 4. **UI displays the parsed text** in real-time
@@ -31,7 +31,7 @@ async for event in agent.stream_async(user_query):
 
 ### Frontend: Event Parser
 
-**File:** `frontend/src/services/agentCoreService.js`
+**File:** `patterns/<backend.pattern>/frontend/src/services/agentCoreService.js`
 
 The parser extracts text from nested Bedrock Converse events in the `event` key:
 
@@ -133,7 +133,7 @@ async for event in agent.stream_async(user_query):
 
 #### Step 2: Frontend Service - Parse Events
 
-**File:** `frontend/src/services/agentCoreService.js`
+**File:** `patterns/<backend.pattern>/frontend/src/services/agentCoreService.js`
 
 Update the parser to handle filtered events. Add optional callbacks for tool and metadata events:
 
@@ -167,7 +167,7 @@ return currentCompletion;
 
 #### Step 3 (Optional): UI Component - Display Status
 
-**File:** `frontend/src/components/chat/ChatInterface.tsx`
+**File:** `patterns/<backend.pattern>/frontend/src/components/chat/ChatInterface.tsx`
 
 Add state and pass callbacks to display tool usage and token counts:
 
@@ -246,7 +246,7 @@ data: {"content": "", "type": "AIMessageChunk", "chunk_position": "last", "usage
 
 ### Frontend Parser
 
-**File:** `frontend/src/services/agentCoreService.js`
+**File:** `patterns/<backend.pattern>/frontend/src/services/agentCoreService.js`
 
 The parser handles LangGraph's content array format and filters by message type:
 

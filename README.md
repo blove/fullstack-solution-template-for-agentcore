@@ -69,32 +69,21 @@ The out-of-the-box architecture is shown above. Note that Amazon Cognito is used
 
 ```
 fullstack-agentcore-solution-template/
-├── frontend/                 # Next.js React frontend application
-│   ├── src/
-│   │   ├── app/            # Next.js app router pages
-│   │   ├── components/     # React components (shadcn/ui)
-│   │   ├── hooks/          # Custom React hooks
-│   │   ├── lib/            # Utility libraries
-│   │   ├── services/       # API service layers
-│   │   └── types/          # TypeScript type definitions
-│   ├── public/             # Static assets and aws-exports.json
-│   ├── components.json     # shadcn/ui configuration
-│   └── package.json
 ├── infra-cdk/               # CDK infrastructure code
 │   ├── lib/                # CDK stack definitions
 │   ├── bin/                # CDK app entry point
 │   ├── lambdas/            # Lambda function code
 │   └── config.yaml         # Deployment configuration
 ├── patterns/               # Agent pattern implementations
-│   ├── strands-single-agent/ # Basic strands agent pattern
-│   │   ├── basic_agent.py  # Agent implementation
-│   │   ├── strands_code_interpreter.py # Code Interpreter wrapper
-│   │   ├── requirements.txt # Agent dependencies
-│   │   └── Dockerfile      # Container configuration
-│   └── langgraph-single-agent/ # LangGraph agent pattern
-│       ├── langgraph_agent.py # Agent implementation
-│       ├── requirements.txt # Agent dependencies
-│       └── Dockerfile      # Container configuration
+│   ├── langgraph-ag-ui-agent/ # LangGraph AG-UI agent pattern
+│   │   ├── frontend/       # Pattern-scoped Next.js app
+│   │   └── server.py       # AG-UI FastAPI server
+│   ├── langgraph-single-agent/ # LangGraph agent pattern
+│   │   ├── frontend/       # Pattern-scoped Next.js app
+│   │   └── langgraph_agent.py # Agent implementation
+│   └── strands-single-agent/ # Basic strands agent pattern
+│       ├── frontend/       # Pattern-scoped Next.js app
+│       └── basic_agent.py  # Agent implementation
 ├── tools/                  # Reusable tools (framework-agnostic)
 │   └── code_interpreter/   # AgentCore Code Interpreter integration
 │       └── code_interpreter_tools.py # Core implementation

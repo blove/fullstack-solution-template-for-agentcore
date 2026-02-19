@@ -65,7 +65,7 @@ frontend:
   certificate_arn: null  # Optional: Set to your ACM certificate ARN
 
 backend:
-  pattern: "strands-single-agent"  # Available patterns: strands-single-agent
+  pattern: "strands-single-agent"  # Available patterns: strands-single-agent, langgraph-single-agent, langgraph-ag-ui-agent
 ```
 
 ## Project Structure

@@ -98,6 +98,16 @@ export class AgentCoreRole extends iam.Role {
               ],
             }),
             new iam.PolicyStatement({
+              sid: "AWSMarketplaceModelSubscriptions",
+              effect: iam.Effect.ALLOW,
+              actions: [
+                "aws-marketplace:ViewSubscriptions",
+                "aws-marketplace:Subscribe",
+                "aws-marketplace:Unsubscribe",
+              ],
+              resources: ["*"],
+            }),
+            new iam.PolicyStatement({
               sid: "SecretsManagerAccess",
               effect: iam.Effect.ALLOW,
               actions: ["secretsmanager:GetSecretValue"],

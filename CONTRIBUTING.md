@@ -67,7 +67,7 @@ This section describes how _FAST contributors_ should get started. If you are a 
 3. **Install Dependencies and test local build**:
    See the [Deployment Guide](docs/DEPLOYMENT.md) for prerequisites and setup instructions.
    
-   For frontend-specific development, see [Frontend README](frontend/README.md).
+   For frontend-specific development, see a pattern frontend README, for example [AG-UI Frontend README](patterns/langgraph-ag-ui-agent/frontend/README.md).
    
    For infrastructure development, see [Infrastructure README](infra-cdk/README.md).
 
@@ -76,7 +76,7 @@ This section describes how _FAST contributors_ should get started. If you are a 
 Familiarize yourself with the project structure:
 
 - `docs/`: Documentation files
-- `frontend/`: Web UI components (React/Next.js)
+- `patterns/<pattern>/frontend/`: Pattern-scoped web UI components (React/Next.js)
 - `gateway/`: Shared utilities and tools for AgentCore Gateway integration
 - `infra-cdk/`: Infrastructure as Code (CDK)
 - `patterns/`: Implementation of Agentic patterns to be deployed into AgentCore
@@ -103,7 +103,7 @@ Familiarize yourself with the project structure:
 3. Write/update tests as necessary
 4. Ensure code passes linting rules:
    - For Python code: `ruff` is configured for this project
-   - For UI code: ESLint is configured in `frontend/.eslintrc`
+   - For UI code: ESLint is configured in each pattern frontend via `patterns/<pattern>/frontend/eslint.config.mjs`
 
 ## Testing Your Changes
 
@@ -112,10 +112,10 @@ Familiarize yourself with the project structure:
    # Run linting and formatting checks
    make all
    
-   # For frontend-specific testing
-   cd frontend
+   # For frontend-specific testing (example pattern)
+   cd patterns/langgraph-ag-ui-agent/frontend
    npm run lint
-   cd ..
+   cd ../../..
    ```
    
    For comprehensive testing procedures, see [Scripts README](scripts/README.md).

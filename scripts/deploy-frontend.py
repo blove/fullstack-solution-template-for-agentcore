@@ -26,6 +26,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Dict, Optional
+from urllib.parse import quote
 
 # Minimum Python version check
 if sys.version_info < (3, 8):
@@ -319,11 +320,24 @@ def generate_aws_exports(
         pattern: Agent pattern name
         frontend_dir: Path to frontend directory
     """
-    required = ["CognitoClientId", "CognitoUserPoolId", "AmplifyUrl", "RuntimeArn", "FeedbackApiUrl"]
+    required = [
+        "CognitoClientId",
+        "CognitoUserPoolId",
+        "AmplifyUrl",
+        "RuntimeArn",
+        "FeedbackApiUrl",
+        "CopilotKitRuntimeUrl",
+    ]
     missing = [k for k in required if k not in outputs]
 
     if missing:
         raise ValueError(f"Missing required stack outputs: {', '.join(missing)}")
+
+    # AgentCore AG-UI invocation URL consumed by the standalone CopilotKit runtime Lambda.
+    # CopilotKit clients should call copilotKitRuntimeUrl (API Gateway URL), not agUiUrl directly.
+    runtime_arn = outputs['RuntimeArn']
+    encoded_arn = quote(runtime_arn, safe='')
+    ag_ui_url = f"https://bedrock-agentcore.{region}.amazonaws.com/runtimes/{encoded_arn}/invocations"
 
     aws_exports = {
         "authority": f"https://cognito-idp.{region}.amazonaws.com/{outputs['CognitoUserPoolId']}",
@@ -333,10 +347,12 @@ def generate_aws_exports(
         "response_type": "code",
         "scope": "email openid profile",
         "automaticSilentRenew": True,
-        "agentRuntimeArn": outputs['RuntimeArn'],
+        "agentRuntimeArn": runtime_arn,
         "awsRegion": region,
         "feedbackApiUrl": outputs['FeedbackApiUrl'],
+        "copilotKitRuntimeUrl": outputs['CopilotKitRuntimeUrl'],
         "agentPattern": pattern,
+        "agUiUrl": ag_ui_url,
     }
 
     public_dir = frontend_dir / "public"
@@ -376,8 +392,8 @@ def main() -> int:
     # Determine paths
     script_dir = Path(__file__).parent.resolve()
     project_root = script_dir.parent
-    frontend_dir = project_root / "frontend"
     config_path = project_root / "infra-cdk" / "config.yaml"
+    config = parse_config_yaml(config_path)
 
     log_info("🚀 Starting frontend deployment process...")
     print()
@@ -406,7 +422,6 @@ def main() -> int:
     stack_name = sys.argv[1] if len(sys.argv) > 1 else os.environ.get('STACK_NAME')
 
     if not stack_name:
-        config = parse_config_yaml(config_path)
         stack_name = config.get("stack_name_base")
 
     if not stack_name:
@@ -442,10 +457,23 @@ def main() -> int:
     log_success(f"Staging Bucket: {deployment_bucket}")
     log_success(f"Region: {region}")
 
-    # Get agent pattern from config
-    config = parse_config_yaml(config_path)
+    # Resolve pattern-scoped frontend path from config
     pattern = config.get("pattern", "strands-single-agent")
+    frontend_dir = project_root / "patterns" / pattern / "frontend"
     log_info(f"Agent pattern: {pattern}")
+    log_info(f"Frontend directory: {frontend_dir}")
+
+    if not frontend_dir.exists():
+        log_error(
+            f"Frontend directory not found for pattern '{pattern}': {frontend_dir}"
+        )
+        log_info("Each pattern must include a frontend/ directory under patterns/<pattern>/frontend")
+        return 1
+
+    package_json = frontend_dir / "package.json"
+    if not package_json.exists():
+        log_error(f"Missing package.json in frontend directory: {frontend_dir}")
+        return 1
 
     # Generate aws-exports.json
     log_info("Generating aws-exports.json...")
@@ -461,8 +489,6 @@ def main() -> int:
 
     # Install dependencies if needed
     node_modules = frontend_dir / "node_modules"
-    package_json = frontend_dir / "package.json"
-
     if not node_modules.exists() or package_json.stat().st_mtime > node_modules.stat().st_mtime:
         log_info("Installing dependencies...")
         try:

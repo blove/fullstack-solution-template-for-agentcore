@@ -1,0 +1,5 @@
+node_modules/
+.next/
+build/
+amplify-deploy.zip
+.env*

@@ -32,6 +32,7 @@ export class BackendStack extends cdk.NestedStack {
   public readonly userPoolClientId: string
   public readonly userPoolDomain: cognito.UserPoolDomain
   public feedbackApiUrl: string
+  public copilotKitRuntimeUrl: string
   public runtimeArn: string
   public memoryArn: string
   private agentName: cdk.CfnParameter
@@ -92,6 +93,9 @@ export class BackendStack extends cdk.NestedStack {
     // Create API Gateway Feedback API resources (example of best-practice API Gateway + Lambda
     // pattern)
     this.createFeedbackApi(props.config, props.frontendUrl, feedbackTable)
+
+    // Create a standalone CopilotKit runtime backend exposed via API Gateway.
+    this.createCopilotKitRuntimeApi(props.config, props.frontendUrl)
   }
 
   private createAgentCoreRuntime(config: AppConfig): void {
@@ -113,6 +117,13 @@ export class BackendStack extends cdk.NestedStack {
 
     const stack = cdk.Stack.of(this)
     const deploymentType = config.backend.deployment_type
+    const entrypointByPattern: Record<string, string[]> = {
+      "strands-single-agent": ["opentelemetry-instrument", "basic_agent.py"],
+      "langgraph-single-agent": ["opentelemetry-instrument", "langgraph_agent.py"],
+      "langgraph-ag-ui-agent": ["opentelemetry-instrument", "server.py"],
+    }
+    const runtimeEntrypoint =
+      entrypointByPattern[pattern] ?? entrypointByPattern["strands-single-agent"]
 
     // Create the agent runtime artifact based on deployment type
     let agentRuntimeArtifact: agentcore.AgentRuntimeArtifact
@@ -202,7 +213,7 @@ export class BackendStack extends cdk.NestedStack {
           objectKey: "deployment_package.zip",
         },
         agentcore.AgentCoreRuntime.PYTHON_3_12,
-        ["opentelemetry-instrument", "basic_agent.py"]
+        runtimeEntrypoint
       )
     } else {
       // DOCKER DEPLOYMENT: Use container-based deployment
@@ -211,6 +222,20 @@ export class BackendStack extends cdk.NestedStack {
         {
           platform: ecr_assets.Platform.LINUX_ARM64,
           file: `patterns/${pattern}/Dockerfile`,
+          ignoreMode: cdk.IgnoreMode.GLOB,
+          exclude: [
+            ".git",
+            ".venv",
+            "infra-cdk/cdk.out",
+            "infra-cdk/node_modules",
+            "frontend/node_modules",
+            "frontend/.next",
+            "**/node_modules",
+            "**/.next",
+            "**/dist",
+            "**/build",
+            "**/__pycache__",
+          ],
         }
       )
     }
@@ -224,7 +249,7 @@ export class BackendStack extends cdk.NestedStack {
     // Configure JWT authorizer with Cognito
     const authorizerConfiguration = agentcore.RuntimeAuthorizerConfiguration.usingJWT(
       `https://cognito-idp.${stack.region}.amazonaws.com/${this.userPoolId}/.well-known/openid-configuration`,
-      [this.userPoolClientId]
+      [this.userPoolClientId, this.machineClient.userPoolClientId]
     )
 
     // Create AgentCore execution role
@@ -549,6 +574,100 @@ export class BackendStack extends cdk.NestedStack {
     })
   }
 
+  private createCopilotKitRuntimeApi(config: AppConfig, frontendUrl: string): void {
+    const encodedRuntimeArn = cdk.Fn.join(
+      "%2F",
+      cdk.Fn.split("/", cdk.Fn.join("%3A", cdk.Fn.split(":", this.runtimeArn)))
+    )
+    const agentCoreAgUiUrl = cdk.Fn.join("", [
+      "https://bedrock-agentcore.",
+      cdk.Stack.of(this).region,
+      ".amazonaws.com/runtimes/",
+      encodedRuntimeArn,
+      "/invocations",
+    ])
+
+    const copilotKitRuntimeLambda = new lambda.Function(this, "CopilotKitRuntimeLambda", {
+      functionName: `${config.stack_name_base}-copilotkit-runtime`,
+      runtime: lambda.Runtime.NODEJS_20_X,
+      architecture: lambda.Architecture.ARM_64,
+      handler: "dist/index.handler",
+      code: lambda.Code.fromAsset(path.join(__dirname, "..", "lambdas", "copilotkit-runtime"), {
+        assetHashType: cdk.AssetHashType.OUTPUT,
+        bundling: {
+          image: lambda.Runtime.NODEJS_20_X.bundlingImage,
+          bundlingFileAccess: cdk.BundlingFileAccess.VOLUME_COPY,
+          environment: {
+            NPM_CONFIG_CACHE: "/tmp/.npm",
+            NPM_CONFIG_FETCH_RETRIES: "5",
+            NPM_CONFIG_FETCH_RETRY_MAXTIMEOUT: "120000",
+          },
+          command: [
+            "bash",
+            "-c",
+            [
+              "mkdir -p /tmp/.npm",
+              "npm ci --no-audit --no-fund",
+              "npm run build",
+              "npm prune --omit=dev",
+              "cp -R dist node_modules package.json package-lock.json /asset-output/",
+            ].join(" && "),
+          ],
+        },
+      }),
+      environment: {
+        AGENTCORE_AG_UI_URL: agentCoreAgUiUrl,
+        CORS_ALLOWED_ORIGINS: `${frontendUrl},http://localhost:3000`,
+        COPILOTKIT_ENDPOINT_PATH: "/copilotkit",
+        COPILOTKIT_AGENT_NAME: "langgraph-ag-ui-agent",
+      },
+      timeout: cdk.Duration.seconds(30),
+      memorySize: 1024,
+      logGroup: new logs.LogGroup(this, "CopilotKitRuntimeLambdaLogGroup", {
+        logGroupName: `/aws/lambda/${config.stack_name_base}-copilotkit-runtime`,
+        retention: logs.RetentionDays.ONE_WEEK,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      }),
+    })
+
+    const copilotKitApi = new apigateway.RestApi(this, "CopilotKitRuntimeApi", {
+      restApiName: `${config.stack_name_base}-copilotkit-runtime-api`,
+      description: "Standalone CopilotKit runtime API backed by Lambda",
+      defaultCorsPreflightOptions: {
+        allowOrigins: [frontendUrl, "http://localhost:3000"],
+        allowMethods: ["GET", "POST", "OPTIONS"],
+        allowHeaders: ["Content-Type", "Authorization"],
+      },
+      deployOptions: {
+        stageName: "prod",
+      },
+    })
+
+    const runtimeIntegration = new apigateway.LambdaIntegration(copilotKitRuntimeLambda, {
+      responseTransferMode: apigateway.ResponseTransferMode.STREAM,
+    })
+    const runtimeResource = copilotKitApi.root.addResource("copilotkit")
+    runtimeResource.addMethod("GET", runtimeIntegration)
+    runtimeResource.addMethod("POST", runtimeIntegration)
+
+    const runtimeProxy = runtimeResource.addResource("{proxy+}")
+    runtimeProxy.addMethod("GET", runtimeIntegration)
+    runtimeProxy.addMethod("POST", runtimeIntegration)
+
+    this.copilotKitRuntimeUrl = copilotKitApi.urlForPath("/copilotkit")
+
+    new ssm.StringParameter(this, "CopilotKitRuntimeUrlParam", {
+      parameterName: `/${config.stack_name_base}/copilotkit-runtime-url`,
+      stringValue: this.copilotKitRuntimeUrl,
+      description: "CopilotKit runtime API URL",
+    })
+
+    new cdk.CfnOutput(this, "CopilotKitRuntimeUrl", {
+      description: "CopilotKit runtime API URL",
+      value: this.copilotKitRuntimeUrl,
+    })
+  }
+
   private createAgentCoreGateway(config: AppConfig): void {
     // Create sample tool Lambda
     const toolLambda = new lambda.Function(this, "SampleToolLambda", {
@@ -581,6 +700,18 @@ export class BackendStack extends cdk.NestedStack {
           "arn:aws:bedrock:*::foundation-model/*",
           `arn:aws:bedrock:*:${this.account}:inference-profile/*`,
         ],
+      })
+    )
+
+    gatewayRole.addToPolicy(
+      new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        actions: [
+          "aws-marketplace:ViewSubscriptions",
+          "aws-marketplace:Subscribe",
+          "aws-marketplace:Unsubscribe",
+        ],
+        resources: ["*"],
       })
     )
 
@@ -639,7 +770,10 @@ export class BackendStack extends cdk.NestedStack {
       authorizerType: "CUSTOM_JWT",
       authorizerConfiguration: {
         customJwtAuthorizer: {
-          allowedClients: [this.machineClient.userPoolClientId],
+          // Allow both:
+          // 1) frontend user tokens (app client), and
+          // 2) machine-to-machine tokens (machine client)
+          allowedClients: [this.userPoolClientId, this.machineClient.userPoolClientId],
           discoveryUrl: cognitoDiscoveryUrl,
         },
       },

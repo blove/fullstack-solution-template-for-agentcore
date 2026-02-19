@@ -20,6 +20,7 @@ Usage:
     
     # Override pattern from config
     uv run scripts/test-agent.py --pattern strands-single-agent
+    uv run scripts/test-agent.py --pattern langgraph-ag-ui-agent
 """
 
 import sys
@@ -103,6 +104,7 @@ def start_local_agent(memory_id: str, region: str, stack_name: str, pattern: str
     pattern_files = {
         "strands-single-agent": "basic_agent.py",
         "langgraph-single-agent": "langgraph_agent.py",
+        "langgraph-ag-ui-agent": "server.py",
     }
     
     agent_file = pattern_files.get(pattern)
@@ -194,12 +196,36 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGINT, signal_handler)
 
 
+def build_ag_ui_payload(prompt: str, session_id: str, user_id: str) -> Dict[str, object]:
+    """
+    Build a minimal AG-UI RunAgentInput payload.
+
+    The AG-UI protocol requires threadId/runId, messages, and supporting fields.
+    """
+    return {
+        "threadId": session_id,
+        "runId": generate_session_id(),
+        "state": {},
+        "messages": [
+            {
+                "id": generate_session_id(),
+                "role": "user",
+                "content": prompt,
+            }
+        ],
+        "tools": [],
+        "context": [],
+        "forwardedProps": {"userId": user_id},
+    }
+
+
 def invoke_agent(
     url: str,
     prompt: str,
     session_id: str,
     user_id: str,
-    headers: Optional[Dict[str, str]] = None
+    headers: Optional[Dict[str, str]] = None,
+    protocol: str = "agentcore",
 ) -> None:
     """
     Invoke agent and print raw streaming events in real-time.
@@ -211,15 +237,20 @@ def invoke_agent(
         user_id (str): User ID
         headers (Optional[Dict[str, str]]): Optional HTTP headers
     """
-    payload = {
-        "prompt": prompt,
-        "runtimeSessionId": session_id,
-        "userId": user_id,
-    }
+    if protocol == "ag_ui":
+        payload = build_ag_ui_payload(prompt, session_id, user_id)
+    else:
+        payload = {
+            "prompt": prompt,
+            "runtimeSessionId": session_id,
+            "userId": user_id,
+        }
     
     if headers is None:
         headers = {}
     headers["Content-Type"] = "application/json"
+    if protocol == "ag_ui":
+        headers.setdefault("Accept", "text/event-stream")
     
     try:
         response = requests.post(url, headers=headers, json=payload, stream=True, timeout=60)
@@ -240,7 +271,7 @@ def invoke_agent(
         print(f"Error: {e}")
 
 
-def run_chat(local_mode: bool, config: Dict[str, str]) -> None:
+def run_chat(local_mode: bool, config: Dict[str, str], pattern: str) -> None:
     """
     Run interactive chat session.
     
@@ -253,6 +284,7 @@ def run_chat(local_mode: bool, config: Dict[str, str]) -> None:
     print_section("Interactive Agent Chat")
     print(f"Session ID: {session_id}")
     print(f"Mode: {'Local (localhost:8080)' if local_mode else 'Remote (deployed agent)'}")
+    print(f"Pattern: {pattern}")
     print(f"\n{Fore.YELLOW}💡 Type 'exit' or 'quit' to end, or press Ctrl+C{Style.RESET_ALL}\n")
     
     while True:
@@ -269,13 +301,16 @@ def run_chat(local_mode: bool, config: Dict[str, str]) -> None:
             # Invoke agent
             start_time = time.time()
             
+            protocol = "ag_ui" if pattern == "langgraph-ag-ui-agent" else "agentcore"
+
             if local_mode:
                 # Local mode
                 invoke_agent(
                     url="http://localhost:8080/invocations",
                     prompt=prompt,
                     session_id=session_id,
-                    user_id="local-test-user"
+                    user_id="local-test-user",
+                    protocol=protocol,
                 )
             else:
                 # Remote mode
@@ -294,7 +329,8 @@ def run_chat(local_mode: bool, config: Dict[str, str]) -> None:
                     prompt=prompt,
                     session_id=session_id,
                     user_id=config["user_id"],
-                    headers=headers
+                    headers=headers,
+                    protocol=protocol,
                 )
             
             elapsed = time.time() - start_time
@@ -328,6 +364,7 @@ Examples:
   
   # Override pattern for local testing
   uv run scripts/test-agent.py --local --pattern strands-single-agent
+  uv run scripts/test-agent.py --local --pattern langgraph-ag-ui-agent
 
 Notes:
   - Remote mode: Tests deployed agent
@@ -346,7 +383,7 @@ Notes:
     parser.add_argument(
         "--pattern",
         type=str,
-        help="Override agent pattern from config (e.g., 'strands-single-agent', 'langgraph-single-agent')"
+        help="Override agent pattern from config (e.g., 'strands-single-agent', 'langgraph-single-agent', 'langgraph-ag-ui-agent')"
     )
     
     return parser.parse_args()
@@ -364,10 +401,11 @@ def main():
     # Get stack configuration
     stack_cfg = get_stack_config()
     
+    # Determine pattern: CLI arg > config.yaml > default
+    pattern = args.pattern if args.pattern else stack_cfg.get("pattern", "strands-single-agent")
+
     # LOCAL MODE
     if args.local:
-        # Determine pattern: CLI arg > config.yaml > default (only needed for local mode)
-        pattern = args.pattern if args.pattern else stack_cfg.get('pattern', 'strands-single-agent')
         print(f"Using pattern: {pattern}\n")
         print_section("LOCAL MODE - Auto-starting agent")
         
@@ -435,7 +473,7 @@ def main():
         print(f"Region: {region}\n")
     
     # Run interactive chat
-    run_chat(args.local, config)
+    run_chat(args.local, config, pattern)
 
 
 if __name__ == "__main__":

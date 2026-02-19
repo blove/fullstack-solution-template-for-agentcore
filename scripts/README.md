@@ -34,11 +34,11 @@ This script automatically:
 
 - `deploy-frontend.py` - Cross-platform frontend deployment script (works on Windows, Mac, Linux).
   Uses only Python standard library and AWS CLI. Handles dependency management and config generation.
+  Reads `backend.pattern` from `infra-cdk/config.yaml` and builds from `patterns/<backend.pattern>/frontend/`.
 
-The script creates `frontend/public/aws-exports.json` with the following structure. This information
-is read by the React application to configure Cognito Authentication. If any of this is incorrect,
-Cognito will not work. It's generated automatically from the scripts, and you should not need to
-change anything:
+The script creates `patterns/<backend.pattern>/frontend/public/aws-exports.json` with configuration consumed by authentication,
+frontend APIs, and the CopilotKit client runtime URL. It's generated from CloudFormation outputs;
+deploy CDK first so all required outputs are available:
 
 ```json
 {
@@ -48,9 +48,18 @@ change anything:
   "post_logout_redirect_uri": "https://your-amplify-url",
   "response_type": "code",
   "scope": "email openid profile",
-  "automaticSilentRenew": true
+  "automaticSilentRenew": true,
+  "agentRuntimeArn": "arn:aws:bedrock-agentcore:region:account:runtime/runtime-id",
+  "awsRegion": "us-west-2",
+  "feedbackApiUrl": "https://api-id.execute-api.region.amazonaws.com/prod/",
+  "copilotKitRuntimeUrl": "https://api-id.execute-api.region.amazonaws.com/prod/copilotkit",
+  "agentPattern": "langgraph-ag-ui-agent",
+  "agUiUrl": "https://bedrock-agentcore.region.amazonaws.com/runtimes/encoded_arn/invocations"
 }
 ```
+
+`copilotKitRuntimeUrl` is the public API Gateway URL for the standalone CopilotKit Lambda backend.
+That Lambda uses `AGENTCORE_AG_UI_URL` internally to call the AgentCore AG-UI invocation endpoint.
 
 ## Requirements
 
@@ -61,6 +70,9 @@ change anything:
   - `CognitoClientId`
   - `CognitoUserPoolId`
   - `AmplifyUrl`
+  - `RuntimeArn`
+  - `FeedbackApiUrl`
+  - `CopilotKitRuntimeUrl`
 
 ## Key Features
 
@@ -132,6 +144,7 @@ uv run scripts/test-agent.py --local --pattern strands-single-agent
 
 - `strands-single-agent` - Basic Strands agent
 - `langgraph-single-agent` - LangGraph agent with streaming
+- `langgraph-ag-ui-agent` - LangGraph agent served via AG-UI (uses AG-UI protocol payloads)
 
 **Prerequisites:**
 
