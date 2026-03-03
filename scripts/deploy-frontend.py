@@ -336,6 +336,7 @@ def generate_aws_exports(
         "agentRuntimeArn": outputs['RuntimeArn'],
         "awsRegion": region,
         "feedbackApiUrl": outputs['FeedbackApiUrl'],
+        "copilotKitRuntimeUrl": outputs.get("CopilotKitRuntimeUrl", ""),
         "agentPattern": pattern,
     }
 

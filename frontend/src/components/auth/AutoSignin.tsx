@@ -1,6 +1,6 @@
 "use client"
 
-import { ReactNode, useEffect, useState, PropsWithChildren } from "react"
+import { ReactNode, PropsWithChildren, useSyncExternalStore } from "react"
 import { useAuth } from "react-oidc-context"
 import { Button } from "@/components/ui/button"
 
@@ -24,11 +24,11 @@ function AutoSigninContent({ children }: PropsWithChildren) {
 }
 
 export function AutoSignin({ children }: { children: ReactNode }) {
-  const [mounted, setMounted] = useState(false)
-
-  useEffect(() => {
-    setMounted(true)
-  }, [])
+  const mounted = useSyncExternalStore(
+    () => () => {},
+    () => true,
+    () => false,
+  )
 
   if (!mounted) {
     return null

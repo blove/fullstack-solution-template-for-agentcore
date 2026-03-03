@@ -2,3 +2,7 @@
 strands-agents==1.16.0
 mcp==1.23.1
 bedrock-agentcore[strands-agents]==1.0.6
+ag-ui-strands==0.1.1
+copilotkit
+fastapi>=0.115.12
+uvicorn

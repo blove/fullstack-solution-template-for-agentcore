@@ -1,20 +1,40 @@
+import base64
+import json
+import logging
 import os
 import traceback
+from typing import Any
 
 import boto3
+import uvicorn
+from ag_ui.core import RunAgentInput, RunErrorEvent, RunFinishedEvent
+from ag_ui.encoder import EventEncoder
+from ag_ui_strands import StrandsAgent
 from bedrock_agentcore.memory.integrations.strands.config import AgentCoreMemoryConfig
 from bedrock_agentcore.memory.integrations.strands.session_manager import (
     AgentCoreMemorySessionManager,
 )
-from bedrock_agentcore.runtime import BedrockAgentCoreApp
-from gateway.utils.gateway_access_token import get_gateway_access_token
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from mcp.client.streamable_http import streamablehttp_client
 from strands import Agent
 from strands.models import BedrockModel
 from strands.tools.mcp import MCPClient
 from strands_code_interpreter import StrandsCodeInterpreterTools
 
-app = BedrockAgentCoreApp()
+from gateway.utils.gateway_access_token import get_gateway_access_token
+
+logger = logging.getLogger("strands_single_agent")
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+logger.setLevel(logging.INFO)
+
+app = FastAPI()
+
+ACTOR_ID_KEYS = ("actor_id", "actorId", "user_id", "userId", "sub")
 
 
 def get_ssm_parameter(parameter_name: str) -> str:
@@ -53,11 +73,7 @@ def create_gateway_mcp_client(access_token: str) -> MCPClient:
     if not stack_name.replace("-", "").replace("_", "").isalnum():
         raise ValueError("Invalid STACK_NAME format")
 
-    print(f"[AGENT] Creating Gateway MCP client for stack: {stack_name}")
-
-    # Fetch Gateway URL from SSM
     gateway_url = get_ssm_parameter(f"/{stack_name}/gateway_url")
-    print(f"[AGENT] Gateway URL from SSM: {gateway_url}")
 
     # Create MCP client with Bearer token authentication
     gateway_client = MCPClient(
@@ -67,7 +83,6 @@ def create_gateway_mcp_client(access_token: str) -> MCPClient:
         prefix="gateway",
     )
 
-    print("[AGENT] Gateway MCP client created successfully")
     return gateway_client
 
 
@@ -101,27 +116,15 @@ def create_basic_agent(user_id: str, session_id: str) -> Agent:
         region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
     )
 
-    # Initialize Code Interpreter tools with boto3 session
     region = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
-    session = boto3.Session(region_name=region)
     code_tools = StrandsCodeInterpreterTools(region)
 
     try:
-        print("[AGENT] Starting agent creation with Gateway tools...")
-
         # Get OAuth2 access token and create Gateway MCP client
-        print("[AGENT] Step 1: Getting OAuth2 access token...")
         access_token = get_gateway_access_token()
-        print(f"[AGENT] Got access token: {access_token[:20]}...")
 
         # Create Gateway MCP client with authentication
-        print("[AGENT] Step 2: Creating Gateway MCP client...")
         gateway_client = create_gateway_mcp_client(access_token)
-        print("[AGENT] Gateway MCP client created successfully")
-
-        print(
-            "[AGENT] Step 3: Creating Agent with Gateway tools and Code Interpreter..."
-        )
         agent = Agent(
             name="BasicAgent",
             system_prompt=system_prompt,
@@ -133,60 +136,215 @@ def create_basic_agent(user_id: str, session_id: str) -> Agent:
                 "session.id": session_id,
             },
         )
-        print(
-            "[AGENT] Agent created successfully with Gateway tools and Code Interpreter"
-        )
         return agent
 
     except Exception as e:
-        print(f"[AGENT ERROR] Error creating Gateway client: {e}")
-        print(f"[AGENT ERROR] Exception type: {type(e).__name__}")
-        print("[AGENT ERROR] Traceback:")
+        logger.error("[AGENT ERROR] Error creating Gateway client: %s", e)
         traceback.print_exc()
-        print(
-            "[AGENT] Gateway connection failed - raising exception instead of fallback"
-        )
         raise
 
 
-@app.entrypoint
-async def agent_stream(payload):
-    """
-    Main entrypoint for the agent using streaming with Gateway integration.
+def decode_jwt_sub(authorization_header: str | None) -> str | None:
+    if not authorization_header:
+        return None
 
-    This is the function that AgentCore Runtime calls when the agent receives a request.
-    It extracts the user's query from the payload, creates an agent with Gateway tools
-    and memory, and streams the response back. This function handles the complete
-    request lifecycle with token-level streaming.
-    """
-    user_query = payload.get("prompt")
-    user_id = payload.get("userId")
-    session_id = payload.get("runtimeSessionId")
+    parts = authorization_header.strip().split()
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        return None
 
-    if not all([user_query, user_id, session_id]):
-        yield {
-            "status": "error",
-            "error": "Missing required fields: prompt, userId, or runtimeSessionId",
-        }
-        return
+    token_parts = parts[1].split(".")
+    if len(token_parts) < 2:
+        return None
 
     try:
-        print(
-            f"[STREAM] Starting streaming invocation for user: {user_id}, session: {session_id}"
+        payload = token_parts[1]
+        payload += "=" * ((4 - len(payload) % 4) % 4)
+        decoded = base64.urlsafe_b64decode(payload.encode("utf-8"))
+        sub = json.loads(decoded).get("sub")
+        return sub if isinstance(sub, str) and sub else None
+    except Exception:
+        return None
+
+
+def resolve_actor_id(
+    input_data: RunAgentInput, authorization_header: str | None
+) -> str | None:
+    forwarded_props = (
+        input_data.forwarded_props
+        if isinstance(input_data.forwarded_props, dict)
+        else {}
+    )
+
+    for key in ACTOR_ID_KEYS:
+        value = forwarded_props.get(key)
+        if isinstance(value, str) and value:
+            return value
+
+    return decode_jwt_sub(authorization_header)
+
+
+def _event_type(event: object) -> str:
+    if isinstance(event, dict):
+        event_type = event.get("type")
+        if hasattr(event_type, "value"):
+            return str(event_type.value)
+        return str(event_type) if event_type else "UNKNOWN"
+
+    event_type = getattr(event, "type", None)
+    if hasattr(event_type, "value"):
+        return str(event_type.value)
+    return str(event_type) if event_type else "UNKNOWN"
+
+
+@app.get("/ping")
+async def ping() -> dict[str, str]:
+    return {"status": "Healthy"}
+
+
+async def _handle_agui(payload: dict[str, Any], request: Request):
+    try:
+        input_data = RunAgentInput.model_validate(payload)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400, detail=f"Invalid AG-UI payload: {exc}"
+        ) from exc
+
+    thread_id = getattr(input_data, "thread_id", None) or "unknown"
+    run_id = getattr(input_data, "run_id", None) or "unknown"
+    actor_id = resolve_actor_id(input_data, request.headers.get("authorization"))
+
+    if not actor_id:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Missing actor identity. Provide forwardedProps.actor_id/user_id "
+                "or Authorization Bearer token with sub claim."
+            ),
         )
-        print(f"[STREAM] Query: {user_query}")
 
-        agent = create_basic_agent(user_id, session_id)
+    if not input_data.thread_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing threadId in AG-UI payload.",
+        )
 
-        # Use the agent's stream_async method for true token-level streaming
-        async for event in agent.stream_async(user_query):
-            yield event
+    session_id = input_data.thread_id
 
-    except Exception as e:
-        print(f"[STREAM ERROR] Error in agent_stream: {e}")
-        traceback.print_exc()
-        yield {"status": "error", "error": str(e)}
+    logger.info(
+        "[AGUI] received thread_id=%s run_id=%s actor_id=%s messages=%s tools=%s",
+        thread_id,
+        run_id,
+        actor_id,
+        len(getattr(input_data, "messages", []) or []),
+        len(getattr(input_data, "tools", []) or []),
+    )
+
+    try:
+        strands_core_agent = create_basic_agent(actor_id, session_id)
+    except Exception as exc:
+        logger.exception(
+            "[AGUI] failed to initialize strands agent thread_id=%s run_id=%s",
+            thread_id,
+            run_id,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to initialize Strands agent: {exc}",
+        ) from exc
+
+    request_agent = StrandsAgent(
+        agent=strands_core_agent,
+        name="StrandsSingleAgent",
+        description="Strands single agent exposed via AG-UI",
+    )
+    request_agent._agents_by_thread[thread_id] = strands_core_agent  # type: ignore[attr-defined]
+
+    encoder = EventEncoder(accept=request.headers.get("accept"))
+
+    async def event_generator():
+        event_count = 0
+        saw_terminal_event = False
+
+        try:
+            async for event in request_agent.run(input_data):
+                event_count += 1
+                event_type = _event_type(event)
+
+                if event_type in {
+                    "RUN_STARTED",
+                    "RUN_FINISHED",
+                    "RUN_ERROR",
+                    "TOOL_CALL_START",
+                    "TOOL_CALL_RESULT",
+                }:
+                    logger.info(
+                        "[AGUI] event thread_id=%s run_id=%s event=%s count=%s",
+                        thread_id,
+                        run_id,
+                        event_type,
+                        event_count,
+                    )
+
+                if event_type in {"RUN_FINISHED", "RUN_ERROR"}:
+                    saw_terminal_event = True
+
+                yield encoder.encode(event)
+        except Exception as exc:
+            saw_terminal_event = True
+            logger.exception(
+                "[AGUI] stream failure thread_id=%s run_id=%s error=%s",
+                thread_id,
+                run_id,
+                exc,
+            )
+            yield encoder.encode(
+                RunErrorEvent(
+                    message=str(exc) or type(exc).__name__,
+                    code=type(exc).__name__,
+                )
+            )
+
+        if not saw_terminal_event:
+            logger.error(
+                "[AGUI] missing terminal event thread_id=%s run_id=%s total_events=%s",
+                thread_id,
+                run_id,
+                event_count,
+            )
+            yield encoder.encode(
+                RunFinishedEvent(
+                    thread_id=thread_id,
+                    run_id=run_id,
+                )
+            )
+
+        logger.info(
+            "[AGUI] stream completed thread_id=%s run_id=%s total_events=%s terminal=%s",
+            thread_id,
+            run_id,
+            event_count,
+            saw_terminal_event,
+        )
+
+    return StreamingResponse(event_generator(), media_type=encoder.get_content_type())
+
+
+@app.post("/invocations")
+async def invocations(request: Request):
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400, detail=f"Invalid JSON body: {exc}"
+        ) from exc
+
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=400, detail="Request body must be a JSON object"
+        )
+
+    return await _handle_agui(payload, request)
 
 
 if __name__ == "__main__":
-    app.run()
+    uvicorn.run(app, host="0.0.0.0", port=8080)
