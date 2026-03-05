@@ -4,6 +4,7 @@ import type {
   Context,
 } from "aws-lambda"
 import { HttpAgent } from "@ag-ui/client"
+import { MCPAppsMiddleware } from "@ag-ui/mcp-apps-middleware"
 import {
   copilotRuntimeNodeHttpEndpoint,
   CopilotRuntime,
@@ -258,11 +259,27 @@ function getRequestBody(
 }
 
 function createRuntimeResponseHandler() {
+  const mcpServerUrl = process.env.MCP_SERVER_URL || "https://mcp.excalidraw.com"
+
+  const agent = new HttpAgent({
+    url: agentCoreAgUiUrl,
+  })
+
+  agent.use(
+    new MCPAppsMiddleware({
+      mcpServers: [
+        {
+          type: "http",
+          url: mcpServerUrl,
+          serverId: "example_mcp_app",
+        },
+      ],
+    })
+  )
+
   const runtime = new CopilotRuntime({
     agents: {
-      [agentName]: new HttpAgent({
-        url: agentCoreAgUiUrl,
-      }),
+      [agentName]: agent,
     } as never,
   })
 
