@@ -27,7 +27,7 @@ from langchain.agents.middleware import (
 )
 from langgraph.runtime import Runtime
 
-LOG = logging.getLogger("langgraph_single_agent")
+LOG = logging.getLogger(__name__)
 PREFIX = "[CKMW]"
 
 

@@ -308,70 +308,70 @@ class ActorAwareLangGraphAgent(LangGraphAgent):
         raise ValueError("Message ID not found in history")
 
 
-class CopilotKitMemorySaver(AgentCoreMemorySaver):
-    """AgentCoreMemorySaver subclass that prevents patch_orphan_tool_calls from
-    injecting error ToolMessages for CopilotKit frontend tool calls.
+class _NoPatchEventProcessor:
+    """EventProcessor that skips patch_orphan_tool_calls.
 
-    The base class patches any AIMessage tool_call that has no corresponding
-    ToolMessage with a fake error ("interrupted before completion").  CopilotKit
-    frontend tools are *intentionally* orphaned — the frontend executes them
-    client-side and adds the real ToolMessage on the next run.  The fake error
-    ToolMessages would then conflict with the real ones, causing duplicate
-    results.
+    CopilotKit frontend tool calls are intentionally orphaned — the frontend
+    executes them client-side and adds the real ToolMessage on the next run.
+    patch_orphan_tool_calls would inject fake error ToolMessages that conflict
+    with the real results.
     """
 
-    @staticmethod
-    def _strip_patched_frontend_tool_messages(
-        checkpoint_tuple: CheckpointTuple,
-    ) -> CheckpointTuple:
-        cv = checkpoint_tuple.checkpoint.get("channel_values", {})
-        messages = cv.get("messages")
-        copilotkit = cv.get("copilotkit")
-        if not messages or not copilotkit:
-            return checkpoint_tuple
+    def __init__(self, original_processor):
+        self._original = original_processor
 
-        intercepted = copilotkit.get("intercepted_tool_calls")
-        if not intercepted:
-            return checkpoint_tuple
+    def process_events(self, events):
+        return self._original.process_events(events)
 
-        # Collect tool_call_ids that were intercepted by the middleware
-        intercepted_ids = {tc.get("id") for tc in intercepted if tc.get("id")}
-        if not intercepted_ids:
-            return checkpoint_tuple
-
-        # Remove only the placeholder ToolMessages that patch_orphan_tool_calls
-        # added for these intercepted (frontend) tool calls.
-        cleaned = [
-            m
-            for m in messages
-            if not (
-                isinstance(m, ToolMessage)
-                and m.tool_call_id in intercepted_ids
-                and m.status == "error"
-                and "interrupted before completion" in (m.content or "")
-            )
+    def build_checkpoint_tuple(self, checkpoint_event, writes, channel_data, config):
+        # Same as original build_checkpoint_tuple but WITHOUT patch_orphan_tool_calls
+        pending_writes = [
+            (write.task_id, write.channel, write.value) for write in writes
         ]
+        parent_config = None
+        if checkpoint_event.parent_checkpoint_id:
+            parent_config = {
+                "configurable": {
+                    "thread_id": config.thread_id,
+                    "actor_id": config.actor_id,
+                    "checkpoint_ns": config.checkpoint_ns,
+                    "checkpoint_id": checkpoint_event.parent_checkpoint_id,
+                }
+            }
 
-        if len(cleaned) != len(messages):
-            logger.info(
-                "[CKMW-SAVER] stripped %d patched ToolMessages for frontend tool calls",
-                len(messages) - len(cleaned),
-            )
-            cv["messages"] = cleaned
+        checkpoint = checkpoint_event.checkpoint_data.copy()
+        channel_values = {}
+        for channel, version in checkpoint.get("channel_versions", {}).items():
+            if (channel, version) in channel_data:
+                channel_values[channel] = channel_data[(channel, version)]
 
-        return checkpoint_tuple
+        # NOTE: We intentionally skip patch_orphan_tool_calls here.
+        # CopilotKit frontend tool calls are left without ToolMessages on purpose.
 
-    def get_tuple(self, config):
-        result = super().get_tuple(config)
-        if result is not None:
-            result = self._strip_patched_frontend_tool_messages(result)
-        return result
+        checkpoint["channel_values"] = channel_values
 
-    def list(self, config, *, filter=None, before=None, limit=None):
-        for item in super().list(
-            config, filter=filter, before=before, limit=limit
-        ):
-            yield self._strip_patched_frontend_tool_messages(item)
+        return CheckpointTuple(
+            config={
+                "configurable": {
+                    "thread_id": config.thread_id,
+                    "actor_id": config.actor_id,
+                    "checkpoint_ns": config.checkpoint_ns,
+                    "checkpoint_id": checkpoint_event.checkpoint_id,
+                }
+            },
+            checkpoint=checkpoint,
+            metadata=checkpoint_event.metadata,
+            parent_config=parent_config,
+            pending_writes=pending_writes,
+        )
+
+
+class CopilotKitMemorySaver(AgentCoreMemorySaver):
+    """AgentCoreMemorySaver that skips patch_orphan_tool_calls entirely."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.processor = _NoPatchEventProcessor(self.processor)
 
 
 def _build_checkpointer() -> CopilotKitMemorySaver:
@@ -386,7 +386,7 @@ def _build_checkpointer() -> CopilotKitMemorySaver:
 
 
 def _build_agui_graph():
-    logger.info("[DEPLOY_CHECK] v6 - keep intercepted_tool_calls in state")
+    logger.info("[DEPLOY_CHECK] v9 - skip patch_orphan_tool_calls + clear intercepted_tool_calls")
     return create_agent(
         model=_build_model(streaming=False),
         tools=[query_data, *TODO_TOOLS],
