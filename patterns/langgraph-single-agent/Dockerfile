@@ -31,6 +31,7 @@ EXPOSE 8080
 
 # Copy only the agent code
 COPY patterns/langgraph-single-agent/langgraph_agent.py .
+COPY patterns/langgraph-single-agent/ck_middleware_local.py .
 COPY patterns/langgraph-single-agent/db.csv .
 
 # Healthcheck using Python (no extra dependencies needed)

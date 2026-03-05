@@ -18,7 +18,7 @@ import uvicorn
 from ag_ui.core import RunAgentInput, RunErrorEvent, RunFinishedEvent
 from ag_ui.encoder import EventEncoder
 from ag_ui_langgraph import LangGraphAgent
-from copilotkit import CopilotKitMiddleware
+from ck_middleware_local import CopilotKitMiddleware
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from langchain.agents import create_agent
@@ -27,6 +27,7 @@ from langchain_aws import ChatBedrock
 from langchain_core.messages import ToolMessage
 from langchain_core.runnables.config import ensure_config
 from langgraph.types import Command
+from langgraph.checkpoint.base import CheckpointTuple
 from langgraph_checkpoint_aws import AgentCoreMemorySaver
 
 logger = logging.getLogger("langgraph_single_agent")
@@ -307,18 +308,85 @@ class ActorAwareLangGraphAgent(LangGraphAgent):
         raise ValueError("Message ID not found in history")
 
 
-def _build_checkpointer() -> AgentCoreMemorySaver:
+class CopilotKitMemorySaver(AgentCoreMemorySaver):
+    """AgentCoreMemorySaver subclass that prevents patch_orphan_tool_calls from
+    injecting error ToolMessages for CopilotKit frontend tool calls.
+
+    The base class patches any AIMessage tool_call that has no corresponding
+    ToolMessage with a fake error ("interrupted before completion").  CopilotKit
+    frontend tools are *intentionally* orphaned — the frontend executes them
+    client-side and adds the real ToolMessage on the next run.  The fake error
+    ToolMessages would then conflict with the real ones, causing duplicate
+    results.
+    """
+
+    @staticmethod
+    def _strip_patched_frontend_tool_messages(
+        checkpoint_tuple: CheckpointTuple,
+    ) -> CheckpointTuple:
+        cv = checkpoint_tuple.checkpoint.get("channel_values", {})
+        messages = cv.get("messages")
+        copilotkit = cv.get("copilotkit")
+        if not messages or not copilotkit:
+            return checkpoint_tuple
+
+        intercepted = copilotkit.get("intercepted_tool_calls")
+        if not intercepted:
+            return checkpoint_tuple
+
+        # Collect tool_call_ids that were intercepted by the middleware
+        intercepted_ids = {tc.get("id") for tc in intercepted if tc.get("id")}
+        if not intercepted_ids:
+            return checkpoint_tuple
+
+        # Remove only the placeholder ToolMessages that patch_orphan_tool_calls
+        # added for these intercepted (frontend) tool calls.
+        cleaned = [
+            m
+            for m in messages
+            if not (
+                isinstance(m, ToolMessage)
+                and m.tool_call_id in intercepted_ids
+                and m.status == "error"
+                and "interrupted before completion" in (m.content or "")
+            )
+        ]
+
+        if len(cleaned) != len(messages):
+            logger.info(
+                "[CKMW-SAVER] stripped %d patched ToolMessages for frontend tool calls",
+                len(messages) - len(cleaned),
+            )
+            cv["messages"] = cleaned
+
+        return checkpoint_tuple
+
+    def get_tuple(self, config):
+        result = super().get_tuple(config)
+        if result is not None:
+            result = self._strip_patched_frontend_tool_messages(result)
+        return result
+
+    def list(self, config, *, filter=None, before=None, limit=None):
+        for item in super().list(
+            config, filter=filter, before=before, limit=limit
+        ):
+            yield self._strip_patched_frontend_tool_messages(item)
+
+
+def _build_checkpointer() -> CopilotKitMemorySaver:
     memory_id = os.environ.get("MEMORY_ID")
     if not memory_id:
         raise ValueError("MEMORY_ID environment variable is required")
 
-    return AgentCoreMemorySaver(
+    return CopilotKitMemorySaver(
         memory_id=memory_id,
         region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
     )
 
 
 def _build_agui_graph():
+    logger.info("[DEPLOY_CHECK] v6 - keep intercepted_tool_calls in state")
     return create_agent(
         model=_build_model(streaming=False),
         tools=[query_data, *TODO_TOOLS],
