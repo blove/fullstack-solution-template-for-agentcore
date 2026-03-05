@@ -252,6 +252,7 @@ def _build_model(streaming: bool) -> ChatBedrock:
     return ChatBedrock(
         model_id="us.anthropic.claude-sonnet-4-5-20250929-v1:0",
         temperature=0.1,
+        max_tokens=16384,
         streaming=streaming,
     )
 
