@@ -18,7 +18,7 @@ import uvicorn
 from ag_ui.core import RunAgentInput, RunErrorEvent, RunFinishedEvent
 from ag_ui.encoder import EventEncoder
 from ag_ui_langgraph import LangGraphAgent
-from ck_middleware_local import CopilotKitMiddleware
+from copilotkit import CopilotKitMiddleware
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from langchain.agents import create_agent
@@ -386,7 +386,7 @@ def _build_checkpointer() -> CopilotKitMemorySaver:
 
 
 def _build_agui_graph():
-    logger.info("[DEPLOY_CHECK] v9 - skip patch_orphan_tool_calls + clear intercepted_tool_calls")
+    logger.info("[DEPLOY_CHECK] v10 - skip patch_orphan_tool_calls, original copilotkit middleware")
     return create_agent(
         model=_build_model(streaming=False),
         tools=[query_data, *TODO_TOOLS],
