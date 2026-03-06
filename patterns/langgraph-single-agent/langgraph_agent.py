@@ -488,9 +488,9 @@ def _build_checkpointer() -> CopilotKitMemorySaver:
 
 
 def _build_agui_graph():
-    logger.info("[DEPLOY_CHECK] v16 - enable streaming")
+    logger.info("[DEPLOY_CHECK] v18 - revert streaming to diagnose JSON error")
     return create_agent(
-        model=_build_model(streaming=True),
+        model=_build_model(streaming=False),
         tools=[query_data, *TODO_TOOLS],
         checkpointer=_build_checkpointer(),
         middleware=[CopilotKitMiddleware()],
