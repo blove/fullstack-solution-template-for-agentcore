@@ -14,6 +14,123 @@ import uuid
 from pathlib import Path
 from typing import Any, Literal, TypedDict, cast
 
+# Fix OpenTelemetry bugs with streaming Bedrock tool calls.
+# Individual function patches (belt-and-suspenders with the _process_event safety net).
+try:
+    from opentelemetry.instrumentation.botocore.extensions import bedrock_utils as _bu
+
+    _orig_decode = _bu._decode_tool_use
+
+    def _safe_decode_tool_use(tool_use):
+        if isinstance(tool_use.get("input"), dict):
+            return
+        _orig_decode(tool_use)
+
+    _bu._decode_tool_use = _safe_decode_tool_use
+
+    _orig_extract = _bu.extract_tool_calls
+
+    def _safe_extract_tool_calls(message, capture_content):
+        content = message.get("content") if isinstance(message, dict) else None
+        if not content:
+            return None
+        if isinstance(content, list):
+            message = {**message, "content": [c for c in content if c is not None]}
+        return _orig_extract(message, capture_content)
+
+    _bu.extract_tool_calls = _safe_extract_tool_calls
+except Exception:
+    pass
+
+
+def _apply_otel_stream_safety():
+    """Make OTel stream processing fault-tolerant.
+
+    Must be called AFTER the first botocore client is created, because
+    aws-opentelemetry-distro patches _process_event lazily via
+    _botocore_patches when the client is first constructed. Patching at
+    module level gets overwritten.
+    """
+    try:
+        from opentelemetry.instrumentation.botocore.extensions import bedrock_utils as _bu2
+        for cls in (_bu2.ConverseStreamWrapper, _bu2.InvokeModelStreamWrapper):
+            orig = cls._process_event
+
+            def _make_safe(fn):
+                def _safe_pe(self, event):
+                    try:
+                        fn(self, event)
+                    except Exception:
+                        pass
+                return _safe_pe
+
+            cls._process_event = _make_safe(orig)
+    except Exception:
+        pass
+
+
+# Fix langchain-aws + CopilotKit streaming bugs for the Converse API:
+# 1. toolUse.input stored as string instead of dict (streaming partial JSON)
+# 2. CopilotKit after_model() strips frontend tool_calls from msg.tool_calls
+#    but NOT from msg.content, leaving orphaned toolUse blocks that Bedrock rejects
+# 3. Orphaned ToolMessages (e.g. frontend tool results sent on follow-up) that
+#    have no matching tool_call in any AIMessage must be stripped
+try:
+    import langchain_aws.chat_models.bedrock_converse as _bc
+    from langchain_core.messages import AIMessage as _AIMessage, ToolMessage as _ToolMessage
+
+    _orig_messages_to_bedrock = _bc._messages_to_bedrock
+
+    def _patched_messages_to_bedrock(messages):
+        # Sync content with tool_calls: remove tool_use content blocks that
+        # aren't in msg.tool_calls (stripped by CopilotKit after_model).
+        for msg in messages:
+            if isinstance(msg, _AIMessage) and isinstance(msg.content, list):
+                tc_ids = {tc["id"] for tc in (msg.tool_calls or [])}
+                msg.content = [
+                    block for block in msg.content
+                    if not (isinstance(block, dict) and block.get("type") == "tool_use"
+                            and block.get("id") not in tc_ids)
+                ]
+
+        # Collect ALL valid tool_call IDs from all AIMessages (both tool_calls
+        # list and content tool_use blocks). Any ToolMessage whose tool_call_id
+        # isn't in this set is orphaned and would cause Bedrock to reject with
+        # "toolResult blocks exceeds toolUse blocks of previous turn".
+        all_tc_ids = set()
+        for msg in messages:
+            if isinstance(msg, _AIMessage):
+                for tc in (msg.tool_calls or []):
+                    all_tc_ids.add(tc["id"])
+                if isinstance(msg.content, list):
+                    for block in msg.content:
+                        if isinstance(block, dict) and block.get("type") == "tool_use":
+                            all_tc_ids.add(block.get("id"))
+
+        messages = [
+            msg for msg in messages
+            if not (isinstance(msg, _ToolMessage) and msg.tool_call_id not in all_tc_ids)
+        ]
+
+        result = _orig_messages_to_bedrock(messages)
+        # Fix string toolUse.input values from streaming
+        for bedrock_msg in result[0]:
+            for block in bedrock_msg.get("content", []):
+                if "toolUse" in block:
+                    inp = block["toolUse"].get("input")
+                    if isinstance(inp, str):
+                        try:
+                            block["toolUse"]["input"] = json.loads(inp) if inp else {}
+                        except (json.JSONDecodeError, TypeError):
+                            block["toolUse"]["input"] = {}
+                    elif inp is None:
+                        block["toolUse"]["input"] = {}
+        return result
+
+    _bc._messages_to_bedrock = _patched_messages_to_bedrock
+except Exception:
+    pass
+
 import uvicorn
 from ag_ui.core import RunAgentInput, RunErrorEvent, RunFinishedEvent
 from ag_ui.encoder import EventEncoder
@@ -255,10 +372,16 @@ def _build_model(streaming: bool) -> ChatBedrock:
         temperature=0.1,
         max_tokens=16384,
         streaming=streaming,
+        beta_use_converse_api=True,
     )
 
 
 class ActorAwareLangGraphAgent(LangGraphAgent):
+    def set_message_in_progress(self, run_id, data):
+        """Fix ag_ui_langgraph bug: messages_in_process[run_id] can be None."""
+        current = self.messages_in_process.get(run_id) or {}
+        self.messages_in_process[run_id] = {**current, **data}
+
     def langgraph_default_merge_state(
         self, state: dict[str, Any], messages: list[Any], input: RunAgentInput
     ) -> dict[str, Any]:
@@ -488,15 +611,19 @@ def _build_checkpointer() -> CopilotKitMemorySaver:
 
 
 def _build_agui_graph():
-    logger.info("[DEPLOY_CHECK] v18 - revert streaming to diagnose JSON error")
-    return create_agent(
-        model=_build_model(streaming=False),
+    logger.info("[DEPLOY_CHECK] v28 - strip ALL orphaned toolResults + deferred OTel safety")
+    graph = create_agent(
+        model=_build_model(streaming=True),
         tools=[query_data, *TODO_TOOLS],
         checkpointer=_build_checkpointer(),
         middleware=[CopilotKitMiddleware()],
         state_schema=AgentState,
         system_prompt=SYSTEM_PROMPT,
     )
+    # Apply OTel safety AFTER create_agent triggers botocore client creation,
+    # which is when _botocore_patches applies its _process_event patches.
+    _apply_otel_stream_safety()
+    return graph
 
 
 @app.on_event("startup")
@@ -606,6 +733,7 @@ async def _handle_agui(payload: dict[str, Any], request: Request):
                 )
                 return
             saw_terminal_event = True
+            tb_str = traceback.format_exc()
             logger.exception(
                 "[AGUI] stream failure thread_id=%s run_id=%s error=%s",
                 thread_id,
@@ -614,7 +742,7 @@ async def _handle_agui(payload: dict[str, Any], request: Request):
             )
             yield encoder.encode(
                 RunErrorEvent(
-                    message=str(exc) or type(exc).__name__,
+                    message=f"{type(exc).__name__}: {exc}\n\n{tb_str}",
                     code=type(exc).__name__,
                 )
             )

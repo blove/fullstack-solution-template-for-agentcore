@@ -29,7 +29,7 @@ USER bedrock_agentcore
 
 EXPOSE 8080
 
-# Copy agent code (cache-bust: v10 - revert streaming)
+# Copy agent code (cache-bust: v20 - strip ALL orphaned toolResults + deferred OTel safety)
 COPY patterns/langgraph-single-agent/langgraph_agent.py .
 COPY patterns/langgraph-single-agent/db.csv .
 
