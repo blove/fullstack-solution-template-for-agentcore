@@ -166,6 +166,7 @@ def manage_todos(todos: list[Todo], runtime: ToolRuntime) -> Command:
                 ToolMessage(
                     content="Successfully updated todos",
                     tool_call_id=runtime.tool_call_id,
+                    name="manage_todos",
                 ),
             ],
         }
