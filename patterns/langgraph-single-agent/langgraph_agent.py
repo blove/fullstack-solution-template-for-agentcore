@@ -24,7 +24,7 @@ from fastapi.responses import StreamingResponse
 from langchain.agents import create_agent
 from langchain.tools import ToolRuntime, tool
 from langchain_aws import ChatBedrock
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.runnables.config import ensure_config
 from langgraph.types import Command
 from langgraph.checkpoint.base import CheckpointTuple
@@ -263,6 +263,103 @@ class ActorAwareLangGraphAgent(LangGraphAgent):
         self, state: dict[str, Any], messages: list[Any], input: RunAgentInput
     ) -> dict[str, Any]:
         merged_state = super().langgraph_default_merge_state(state, messages, input)
+
+        # Fix orphaned frontend tool_calls in checkpoint AIMessages.
+        # CopilotKit middleware restores frontend tool_calls (e.g. enableAppMode)
+        # to AIMessages after the run but doesn't add ToolMessages. On follow-up
+        # requests the frontend sends ToolMessages for these, which get appended
+        # at the wrong position causing Bedrock API errors.
+        #
+        # Strategy: strip orphaned tool_calls from checkpoint AIMessages and
+        # filter their stray ToolMessages from new messages. However, if the
+        # AIMessage is at the TAIL of the checkpoint (no non-ToolMessage messages
+        # after it), an incoming ToolMessage can be safely appended — so we
+        # keep those tool_calls to avoid breaking the continuation loop for
+        # frontend tools like show_pie_chart.
+        checkpoint_messages = state.get("messages", [])
+        new_messages = merged_state.get("messages", [])
+
+        checkpoint_tool_result_ids = {
+            msg.tool_call_id
+            for msg in checkpoint_messages
+            if isinstance(msg, ToolMessage)
+        }
+        new_tool_result_ids = {
+            msg.tool_call_id
+            for msg in new_messages
+            if isinstance(msg, ToolMessage)
+        }
+
+        orphan_tool_call_ids: set[str] = set()
+        replacement_ai_messages: list[AIMessage] = []
+        for idx, msg in enumerate(checkpoint_messages):
+            if not (isinstance(msg, AIMessage) and msg.tool_calls):
+                continue
+
+            # Find tool_calls with no ToolMessage in the checkpoint
+            unmatched = {
+                tc["id"] for tc in msg.tool_calls
+                if tc["id"] not in checkpoint_tool_result_ids
+            }
+            if not unmatched:
+                continue
+
+            # Can we safely append ToolMessages after this AIMessage?
+            # Only if there are no non-ToolMessage messages after it
+            # (ToolMessages for THIS AIMessage's tool_calls are OK).
+            ai_tc_ids = {tc["id"] for tc in msg.tool_calls}
+            can_append = True
+            for later in checkpoint_messages[idx + 1:]:
+                if isinstance(later, ToolMessage) and later.tool_call_id in ai_tc_ids:
+                    continue
+                can_append = False
+                break
+
+            if can_append:
+                # Only strip unmatched tool_calls that have NO incoming ToolMessage
+                to_strip = unmatched - new_tool_result_ids
+            else:
+                # Can't append at the right position — strip ALL unmatched
+                to_strip = unmatched
+
+            if to_strip:
+                orphan_tool_call_ids.update(to_strip)
+                kept = [tc for tc in msg.tool_calls if tc["id"] not in to_strip]
+                new_content = msg.content
+                if isinstance(new_content, list):
+                    new_content = [
+                        block for block in new_content
+                        if not (
+                            isinstance(block, dict)
+                            and block.get("type") == "tool_use"
+                            and block.get("id") in to_strip
+                        )
+                    ]
+                replacement_ai_messages.append(
+                    msg.model_copy(update={
+                        "tool_calls": kept,
+                        "content": new_content,
+                    })
+                )
+                logger.info(
+                    "[MERGE] Will replace AIMessage %s to strip orphan tool_calls: %s",
+                    msg.id,
+                    to_strip,
+                )
+
+        if orphan_tool_call_ids:
+            filtered = list(replacement_ai_messages)
+            for msg in new_messages:
+                if isinstance(msg, ToolMessage) and msg.tool_call_id in orphan_tool_call_ids:
+                    logger.info(
+                        "[MERGE] Filtering stray ToolMessage tool_call_id=%s",
+                        msg.tool_call_id,
+                    )
+                    continue
+                filtered.append(msg)
+            merged_state["messages"] = filtered
+        # else: no orphans, pass through new_messages unchanged
+
         tools = merged_state.get("tools", [])
         copilotkit_state = merged_state.get("copilotkit", {})
         if not isinstance(copilotkit_state, dict):
@@ -317,6 +414,9 @@ class _NoPatchEventProcessor:
     executes them client-side and adds the real ToolMessage on the next run.
     patch_orphan_tool_calls would inject fake error ToolMessages that conflict
     with the real results.
+
+    Orphaned tool_calls are instead handled at merge time in
+    ActorAwareLangGraphAgent.langgraph_default_merge_state.
     """
 
     def __init__(self, original_processor):
@@ -326,7 +426,6 @@ class _NoPatchEventProcessor:
         return self._original.process_events(events)
 
     def build_checkpoint_tuple(self, checkpoint_event, writes, channel_data, config):
-        # Same as original build_checkpoint_tuple but WITHOUT patch_orphan_tool_calls
         pending_writes = [
             (write.task_id, write.channel, write.value) for write in writes
         ]
@@ -348,7 +447,8 @@ class _NoPatchEventProcessor:
                 channel_values[channel] = channel_data[(channel, version)]
 
         # NOTE: We intentionally skip patch_orphan_tool_calls here.
-        # CopilotKit frontend tool calls are left without ToolMessages on purpose.
+        # Orphaned frontend tool_calls are handled in langgraph_default_merge_state
+        # by filtering stray ToolMessages instead.
 
         checkpoint["channel_values"] = channel_values
 
@@ -388,7 +488,7 @@ def _build_checkpointer() -> CopilotKitMemorySaver:
 
 
 def _build_agui_graph():
-    logger.info("[DEPLOY_CHECK] v10 - skip patch_orphan_tool_calls, original copilotkit middleware")
+    logger.info("[DEPLOY_CHECK] v15 - position-aware orphan stripping")
     return create_agent(
         model=_build_model(streaming=False),
         tools=[query_data, *TODO_TOOLS],

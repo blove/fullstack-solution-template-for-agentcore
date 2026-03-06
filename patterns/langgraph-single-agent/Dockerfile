@@ -29,7 +29,7 @@ USER bedrock_agentcore
 
 EXPOSE 8080
 
-# Copy agent code (cache-bust: v2 - checkpoint fix for frontend tool calls)
+# Copy agent code (cache-bust: v7 - position-aware orphan stripping)
 COPY patterns/langgraph-single-agent/langgraph_agent.py .
 COPY patterns/langgraph-single-agent/db.csv .
 
