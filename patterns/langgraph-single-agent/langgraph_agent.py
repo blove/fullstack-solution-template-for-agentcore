@@ -488,9 +488,9 @@ def _build_checkpointer() -> CopilotKitMemorySaver:
 
 
 def _build_agui_graph():
-    logger.info("[DEPLOY_CHECK] v15 - position-aware orphan stripping")
+    logger.info("[DEPLOY_CHECK] v16 - enable streaming")
     return create_agent(
-        model=_build_model(streaming=False),
+        model=_build_model(streaming=True),
         tools=[query_data, *TODO_TOOLS],
         checkpointer=_build_checkpointer(),
         middleware=[CopilotKitMiddleware()],
