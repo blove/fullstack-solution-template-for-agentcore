@@ -16,12 +16,9 @@ from typing import Any, Literal, TypedDict, cast
 
 
 
-# Fix langchain-aws + CopilotKit streaming bugs for the Converse API:
-# 1. toolUse.input stored as string instead of dict (streaming partial JSON)
-# 2. CopilotKit after_model() strips frontend tool_calls from msg.tool_calls
-#    but NOT from msg.content, leaving orphaned toolUse blocks that Bedrock rejects
-# 3. Orphaned ToolMessages (e.g. frontend tool results sent on follow-up) that
-#    have no matching tool_call in any AIMessage must be stripped
+# Fix CopilotKit + Bedrock Converse API compatibility:
+# Orphaned ToolMessages (e.g. frontend tool results sent on follow-up) that
+# have no matching tool_call in any AIMessage must be stripped
 try:
     import langchain_aws.chat_models.bedrock_converse as _bc
     from langchain_core.messages import AIMessage as _AIMessage, ToolMessage as _ToolMessage
@@ -29,17 +26,6 @@ try:
     _orig_messages_to_bedrock = _bc._messages_to_bedrock
 
     def _patched_messages_to_bedrock(messages):
-        # Sync content with tool_calls: remove tool_use content blocks that
-        # aren't in msg.tool_calls (stripped by CopilotKit after_model).
-        for msg in messages:
-            if isinstance(msg, _AIMessage) and isinstance(msg.content, list):
-                tc_ids = {tc["id"] for tc in (msg.tool_calls or [])}
-                msg.content = [
-                    block for block in msg.content
-                    if not (isinstance(block, dict) and block.get("type") == "tool_use"
-                            and block.get("id") not in tc_ids)
-                ]
-
         # Collect ALL valid tool_call IDs from all AIMessages (both tool_calls
         # list and content tool_use blocks). Any ToolMessage whose tool_call_id
         # isn't in this set is orphaned and would cause Bedrock to reject with
