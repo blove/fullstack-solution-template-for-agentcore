@@ -26,6 +26,17 @@ try:
     _orig_messages_to_bedrock = _bc._messages_to_bedrock
 
     def _patched_messages_to_bedrock(messages):
+        # Sync content with tool_calls: remove tool_use content blocks that
+        # aren't in msg.tool_calls (stripped by CopilotKit after_model).
+        for msg in messages:
+            if isinstance(msg, _AIMessage) and isinstance(msg.content, list):
+                tc_ids = {tc["id"] for tc in (msg.tool_calls or [])}
+                msg.content = [
+                    block for block in msg.content
+                    if not (isinstance(block, dict) and block.get("type") == "tool_use"
+                            and block.get("id") not in tc_ids)
+                ]
+
         # Collect ALL valid tool_call IDs from all AIMessages (both tool_calls
         # list and content tool_use blocks). Any ToolMessage whose tool_call_id
         # isn't in this set is orphaned and would cause Bedrock to reject with
@@ -45,7 +56,20 @@ try:
             if not (isinstance(msg, _ToolMessage) and msg.tool_call_id not in all_tc_ids)
         ]
 
-        return _orig_messages_to_bedrock(messages)
+        result = _orig_messages_to_bedrock(messages)
+        # Fix string toolUse.input values from streaming (stored in checkpoints)
+        for bedrock_msg in result[0]:
+            for block in bedrock_msg.get("content", []):
+                if "toolUse" in block:
+                    inp = block["toolUse"].get("input")
+                    if isinstance(inp, str):
+                        try:
+                            block["toolUse"]["input"] = json.loads(inp) if inp else {}
+                        except (json.JSONDecodeError, TypeError):
+                            block["toolUse"]["input"] = {}
+                    elif inp is None:
+                        block["toolUse"]["input"] = {}
+        return result
 
     _bc._messages_to_bedrock = _patched_messages_to_bedrock
 except Exception:
