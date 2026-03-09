@@ -170,11 +170,6 @@ def query_data(query: str) -> dict[str, Any]:
     """
     Query the database. Always call this before showing a chart or graph.
     """
-    query_preview = (query or "").strip().replace("\n", " ")
-    if len(query_preview) > 200:
-        query_preview = f"{query_preview[:200]}..."
-    logger.info("[TOOL query_data] start query=%s", query_preview or "<empty>")
-
     # Copy row dicts so callers cannot mutate module-level cached data.
     rows = [dict(row) for row in _CACHED_ROWS]
     query_lower = query.lower()
@@ -202,12 +197,6 @@ def query_data(query: str) -> dict[str, Any]:
         "raw_row_count": len(rows),
     }
 
-    logger.info(
-        "[TOOL query_data] end selected_view=%s points=%s raw_row_count=%s",
-        selected_view,
-        len(data),
-        len(rows),
-    )
     return result
 
 
@@ -408,20 +397,11 @@ class ActorAwareLangGraphAgent(LangGraphAgent):
                         "content": new_content,
                     })
                 )
-                logger.info(
-                    "[MERGE] Will replace AIMessage %s to strip orphan tool_calls: %s",
-                    msg.id,
-                    to_strip,
-                )
 
         if orphan_tool_call_ids:
             filtered = list(replacement_ai_messages)
             for msg in new_messages:
                 if isinstance(msg, ToolMessage) and msg.tool_call_id in orphan_tool_call_ids:
-                    logger.info(
-                        "[MERGE] Filtering stray ToolMessage tool_call_id=%s",
-                        msg.tool_call_id,
-                    )
                     continue
                 filtered.append(msg)
             merged_state["messages"] = filtered
@@ -555,7 +535,6 @@ def _build_checkpointer() -> CopilotKitMemorySaver:
 
 
 def _build_agui_graph():
-    logger.info("[DEPLOY_CHECK] v28 - strip ALL orphaned toolResults + deferred OTel safety")
     graph = create_agent(
         model=_build_model(streaming=True),
         tools=[query_data, *TODO_TOOLS],
@@ -576,10 +555,8 @@ async def startup_event() -> None:
             description="LangGraph single agent exposed via AG-UI",
             graph=graph,
         )
-        logger.info("[STARTUP] AG-UI endpoint mounted at POST /invocations")
     except Exception as exc:
-        logger.error("[STARTUP ERROR] Failed to initialize AG-UI graph: %s", exc)
-        traceback.print_exc()
+        logger.error("[STARTUP ERROR] %s", exc)
         raise
 
 
@@ -609,15 +586,6 @@ async def _handle_agui(payload: dict[str, Any], request: Request):
             ),
         )
 
-    logger.info(
-        "[AGUI] received thread_id=%s run_id=%s actor_id=%s messages=%s tools=%s",
-        thread_id,
-        run_id,
-        actor_id,
-        len(getattr(input_data, "messages", []) or []),
-        len(getattr(input_data, "tools", []) or []),
-    )
-
     base_agent = cast(ActorAwareLangGraphAgent, app.state.agui_agent)
     request_agent = ActorAwareLangGraphAgent(
         name=base_agent.name,
@@ -629,86 +597,29 @@ async def _handle_agui(payload: dict[str, Any], request: Request):
     encoder = EventEncoder(accept=request.headers.get("accept"))
 
     async def event_generator():
-        event_count = 0
         saw_terminal_event = False
 
         try:
             async for event in request_agent.run(input_data):
-                event_count += 1
-                if isinstance(event, dict):
-                    event_type_raw = event.get("type")
-                else:
-                    event_type_raw = getattr(event, "type", None)
-                if hasattr(event_type_raw, "value"):
-                    event_type = str(event_type_raw.value)
-                elif event_type_raw:
-                    event_type = str(event_type_raw)
-                else:
-                    event_type = "UNKNOWN"
-
-                if event_type in {
-                    "RUN_STARTED",
-                    "RUN_FINISHED",
-                    "RUN_ERROR",
-                    "TOOL_CALL_START",
-                    "TOOL_CALL_RESULT",
-                }:
-                    logger.info(
-                        "[AGUI] event thread_id=%s run_id=%s event=%s count=%s",
-                        thread_id,
-                        run_id,
-                        event_type,
-                        event_count,
-                    )
-
+                event_type = getattr(getattr(event, "type", None), "value", None) \
+                    or (event.get("type") if isinstance(event, dict) else None)
                 if event_type in {"RUN_FINISHED", "RUN_ERROR"}:
                     saw_terminal_event = True
-
                 yield encoder.encode(event)
+        except asyncio.CancelledError:
+            return
         except Exception as exc:
-            if isinstance(exc, asyncio.CancelledError):
-                logger.info(
-                    "[AGUI] stream cancelled thread_id=%s run_id=%s",
-                    thread_id,
-                    run_id,
-                )
-                return
             saw_terminal_event = True
-            tb_str = traceback.format_exc()
-            logger.exception(
-                "[AGUI] stream failure thread_id=%s run_id=%s error=%s",
-                thread_id,
-                run_id,
-                exc,
-            )
+            logger.exception("[AGUI] stream failure thread_id=%s run_id=%s", thread_id, run_id)
             yield encoder.encode(
                 RunErrorEvent(
-                    message=f"{type(exc).__name__}: {exc}\n\n{tb_str}",
+                    message=f"{type(exc).__name__}: {exc}\n\n{traceback.format_exc()}",
                     code=type(exc).__name__,
                 )
             )
 
         if not saw_terminal_event:
-            logger.error(
-                "[AGUI] missing terminal event thread_id=%s run_id=%s total_events=%s",
-                thread_id,
-                run_id,
-                event_count,
-            )
-            yield encoder.encode(
-                RunFinishedEvent(
-                    threadId=thread_id,
-                    runId=run_id,
-                )
-            )
-
-        logger.info(
-            "[AGUI] stream completed thread_id=%s run_id=%s total_events=%s terminal=%s",
-            thread_id,
-            run_id,
-            event_count,
-            saw_terminal_event,
-        )
+            yield encoder.encode(RunFinishedEvent(threadId=thread_id, runId=run_id))
 
     return StreamingResponse(event_generator(), media_type=encoder.get_content_type())
 
