@@ -43,31 +43,6 @@ except Exception:
     pass
 
 
-def _apply_otel_stream_safety():
-    """Make OTel stream processing fault-tolerant.
-
-    Must be called AFTER the first botocore client is created, because
-    aws-opentelemetry-distro patches _process_event lazily via
-    _botocore_patches when the client is first constructed. Patching at
-    module level gets overwritten.
-    """
-    try:
-        from opentelemetry.instrumentation.botocore.extensions import bedrock_utils as _bu2
-        for cls in (_bu2.ConverseStreamWrapper, _bu2.InvokeModelStreamWrapper):
-            orig = cls._process_event
-
-            def _make_safe(fn):
-                def _safe_pe(self, event):
-                    try:
-                        fn(self, event)
-                    except Exception:
-                        pass
-                return _safe_pe
-
-            cls._process_event = _make_safe(orig)
-    except Exception:
-        pass
-
 
 # Fix langchain-aws + CopilotKit streaming bugs for the Converse API:
 # 1. toolUse.input stored as string instead of dict (streaming partial JSON)
@@ -620,9 +595,6 @@ def _build_agui_graph():
         state_schema=AgentState,
         system_prompt=SYSTEM_PROMPT,
     )
-    # Apply OTel safety AFTER create_agent triggers botocore client creation,
-    # which is when _botocore_patches applies its _process_event patches.
-    _apply_otel_stream_safety()
     return graph
 
 
