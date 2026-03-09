@@ -8,7 +8,8 @@
     "start": "next start",
     "lint": "eslint src/",
     "lint:fix": "eslint src/ --fix",
-    "clean": "rm -rf build/ node_modules/ .next/"
+    "clean": "rm -rf build/ node_modules/ .next/",
+    "postinstall": "sed -i.bak 's/const version = __VERSION__/const version = \"0.16.34\"/' node_modules/katex/dist/katex.mjs && rm -f node_modules/katex/dist/katex.mjs.bak"
   },
   "dependencies": {
     "@copilotkit/react-core": "^1.52.1",
