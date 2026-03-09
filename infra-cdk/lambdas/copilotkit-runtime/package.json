@@ -8,8 +8,9 @@
     "build": "tsc -p tsconfig.json"
   },
   "dependencies": {
-    "@ag-ui/client": "^0.0.44",
-    "@copilotkit/runtime": "^1.51.3"
+    "@ag-ui/client": "^0.0.47",
+    "@ag-ui/mcp-apps-middleware": "^0.0.3",
+    "@copilotkit/runtime": "^1.52.1"
   },
   "devDependencies": {
     "@types/aws-lambda": "^8.10.152",

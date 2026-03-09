@@ -14,6 +14,67 @@ import uuid
 from pathlib import Path
 from typing import Any, Literal, TypedDict, cast
 
+
+
+# Fix CopilotKit + Bedrock Converse API compatibility:
+# Orphaned ToolMessages (e.g. frontend tool results sent on follow-up) that
+# have no matching tool_call in any AIMessage must be stripped
+try:
+    import langchain_aws.chat_models.bedrock_converse as _bc
+    from langchain_core.messages import AIMessage as _AIMessage, ToolMessage as _ToolMessage
+
+    _orig_messages_to_bedrock = _bc._messages_to_bedrock
+
+    def _patched_messages_to_bedrock(messages):
+        # Sync content with tool_calls: remove tool_use content blocks that
+        # aren't in msg.tool_calls (stripped by CopilotKit after_model).
+        for msg in messages:
+            if isinstance(msg, _AIMessage) and isinstance(msg.content, list):
+                tc_ids = {tc["id"] for tc in (msg.tool_calls or [])}
+                msg.content = [
+                    block for block in msg.content
+                    if not (isinstance(block, dict) and block.get("type") == "tool_use"
+                            and block.get("id") not in tc_ids)
+                ]
+
+        # Collect ALL valid tool_call IDs from all AIMessages (both tool_calls
+        # list and content tool_use blocks). Any ToolMessage whose tool_call_id
+        # isn't in this set is orphaned and would cause Bedrock to reject with
+        # "toolResult blocks exceeds toolUse blocks of previous turn".
+        all_tc_ids = set()
+        for msg in messages:
+            if isinstance(msg, _AIMessage):
+                for tc in (msg.tool_calls or []):
+                    all_tc_ids.add(tc["id"])
+                if isinstance(msg.content, list):
+                    for block in msg.content:
+                        if isinstance(block, dict) and block.get("type") == "tool_use":
+                            all_tc_ids.add(block.get("id"))
+
+        messages = [
+            msg for msg in messages
+            if not (isinstance(msg, _ToolMessage) and msg.tool_call_id not in all_tc_ids)
+        ]
+
+        result = _orig_messages_to_bedrock(messages)
+        # Fix string toolUse.input values from streaming (stored in checkpoints)
+        for bedrock_msg in result[0]:
+            for block in bedrock_msg.get("content", []):
+                if "toolUse" in block:
+                    inp = block["toolUse"].get("input")
+                    if isinstance(inp, str):
+                        try:
+                            block["toolUse"]["input"] = json.loads(inp) if inp else {}
+                        except (json.JSONDecodeError, TypeError):
+                            block["toolUse"]["input"] = {}
+                    elif inp is None:
+                        block["toolUse"]["input"] = {}
+        return result
+
+    _bc._messages_to_bedrock = _patched_messages_to_bedrock
+except Exception:
+    pass
+
 import uvicorn
 from ag_ui.core import RunAgentInput, RunErrorEvent, RunFinishedEvent
 from ag_ui.encoder import EventEncoder
@@ -24,9 +85,10 @@ from fastapi.responses import StreamingResponse
 from langchain.agents import create_agent
 from langchain.tools import ToolRuntime, tool
 from langchain_aws import ChatBedrock
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.runnables.config import ensure_config
 from langgraph.types import Command
+from langgraph.checkpoint.base import CheckpointTuple
 from langgraph_checkpoint_aws import AgentCoreMemorySaver
 
 logger = logging.getLogger("langgraph_single_agent")
@@ -108,11 +170,6 @@ def query_data(query: str) -> dict[str, Any]:
     """
     Query the database. Always call this before showing a chart or graph.
     """
-    query_preview = (query or "").strip().replace("\n", " ")
-    if len(query_preview) > 200:
-        query_preview = f"{query_preview[:200]}..."
-    logger.info("[TOOL query_data] start query=%s", query_preview or "<empty>")
-
     # Copy row dicts so callers cannot mutate module-level cached data.
     rows = [dict(row) for row in _CACHED_ROWS]
     query_lower = query.lower()
@@ -140,12 +197,6 @@ def query_data(query: str) -> dict[str, Any]:
         "raw_row_count": len(rows),
     }
 
-    logger.info(
-        "[TOOL query_data] end selected_view=%s points=%s raw_row_count=%s",
-        selected_view,
-        len(data),
-        len(rows),
-    )
     return result
 
 
@@ -165,6 +216,7 @@ def manage_todos(todos: list[Todo], runtime: ToolRuntime) -> Command:
                 ToolMessage(
                     content="Successfully updated todos",
                     tool_call_id=runtime.tool_call_id,
+                    name="manage_todos",
                 ),
             ],
         }
@@ -251,15 +303,110 @@ def _build_model(streaming: bool) -> ChatBedrock:
     return ChatBedrock(
         model_id="us.anthropic.claude-sonnet-4-5-20250929-v1:0",
         temperature=0.1,
+        max_tokens=16384,
         streaming=streaming,
+        beta_use_converse_api=True,
     )
 
 
 class ActorAwareLangGraphAgent(LangGraphAgent):
+    def set_message_in_progress(self, run_id, data):
+        """Fix ag_ui_langgraph bug: messages_in_process[run_id] can be None."""
+        current = self.messages_in_process.get(run_id) or {}
+        self.messages_in_process[run_id] = {**current, **data}
+
     def langgraph_default_merge_state(
         self, state: dict[str, Any], messages: list[Any], input: RunAgentInput
     ) -> dict[str, Any]:
         merged_state = super().langgraph_default_merge_state(state, messages, input)
+
+        # Fix orphaned frontend tool_calls in checkpoint AIMessages.
+        # CopilotKit middleware restores frontend tool_calls (e.g. enableAppMode)
+        # to AIMessages after the run but doesn't add ToolMessages. On follow-up
+        # requests the frontend sends ToolMessages for these, which get appended
+        # at the wrong position causing Bedrock API errors.
+        #
+        # Strategy: strip orphaned tool_calls from checkpoint AIMessages and
+        # filter their stray ToolMessages from new messages. However, if the
+        # AIMessage is at the TAIL of the checkpoint (no non-ToolMessage messages
+        # after it), an incoming ToolMessage can be safely appended — so we
+        # keep those tool_calls to avoid breaking the continuation loop for
+        # frontend tools like show_pie_chart.
+        checkpoint_messages = state.get("messages", [])
+        new_messages = merged_state.get("messages", [])
+
+        checkpoint_tool_result_ids = {
+            msg.tool_call_id
+            for msg in checkpoint_messages
+            if isinstance(msg, ToolMessage)
+        }
+        new_tool_result_ids = {
+            msg.tool_call_id
+            for msg in new_messages
+            if isinstance(msg, ToolMessage)
+        }
+
+        orphan_tool_call_ids: set[str] = set()
+        replacement_ai_messages: list[AIMessage] = []
+        for idx, msg in enumerate(checkpoint_messages):
+            if not (isinstance(msg, AIMessage) and msg.tool_calls):
+                continue
+
+            # Find tool_calls with no ToolMessage in the checkpoint
+            unmatched = {
+                tc["id"] for tc in msg.tool_calls
+                if tc["id"] not in checkpoint_tool_result_ids
+            }
+            if not unmatched:
+                continue
+
+            # Can we safely append ToolMessages after this AIMessage?
+            # Only if there are no non-ToolMessage messages after it
+            # (ToolMessages for THIS AIMessage's tool_calls are OK).
+            ai_tc_ids = {tc["id"] for tc in msg.tool_calls}
+            can_append = True
+            for later in checkpoint_messages[idx + 1:]:
+                if isinstance(later, ToolMessage) and later.tool_call_id in ai_tc_ids:
+                    continue
+                can_append = False
+                break
+
+            if can_append:
+                # Only strip unmatched tool_calls that have NO incoming ToolMessage
+                to_strip = unmatched - new_tool_result_ids
+            else:
+                # Can't append at the right position — strip ALL unmatched
+                to_strip = unmatched
+
+            if to_strip:
+                orphan_tool_call_ids.update(to_strip)
+                kept = [tc for tc in msg.tool_calls if tc["id"] not in to_strip]
+                new_content = msg.content
+                if isinstance(new_content, list):
+                    new_content = [
+                        block for block in new_content
+                        if not (
+                            isinstance(block, dict)
+                            and block.get("type") == "tool_use"
+                            and block.get("id") in to_strip
+                        )
+                    ]
+                replacement_ai_messages.append(
+                    msg.model_copy(update={
+                        "tool_calls": kept,
+                        "content": new_content,
+                    })
+                )
+
+        if orphan_tool_call_ids:
+            filtered = list(replacement_ai_messages)
+            for msg in new_messages:
+                if isinstance(msg, ToolMessage) and msg.tool_call_id in orphan_tool_call_ids:
+                    continue
+                filtered.append(msg)
+            merged_state["messages"] = filtered
+        # else: no orphans, pass through new_messages unchanged
+
         tools = merged_state.get("tools", [])
         copilotkit_state = merged_state.get("copilotkit", {})
         if not isinstance(copilotkit_state, dict):
@@ -307,26 +454,96 @@ class ActorAwareLangGraphAgent(LangGraphAgent):
         raise ValueError("Message ID not found in history")
 
 
-def _build_checkpointer() -> AgentCoreMemorySaver:
+class _NoPatchEventProcessor:
+    """EventProcessor that skips patch_orphan_tool_calls.
+
+    CopilotKit frontend tool calls are intentionally orphaned — the frontend
+    executes them client-side and adds the real ToolMessage on the next run.
+    patch_orphan_tool_calls would inject fake error ToolMessages that conflict
+    with the real results.
+
+    Orphaned tool_calls are instead handled at merge time in
+    ActorAwareLangGraphAgent.langgraph_default_merge_state.
+    """
+
+    def __init__(self, original_processor):
+        self._original = original_processor
+
+    def process_events(self, events):
+        return self._original.process_events(events)
+
+    def build_checkpoint_tuple(self, checkpoint_event, writes, channel_data, config):
+        pending_writes = [
+            (write.task_id, write.channel, write.value) for write in writes
+        ]
+        parent_config = None
+        if checkpoint_event.parent_checkpoint_id:
+            parent_config = {
+                "configurable": {
+                    "thread_id": config.thread_id,
+                    "actor_id": config.actor_id,
+                    "checkpoint_ns": config.checkpoint_ns,
+                    "checkpoint_id": checkpoint_event.parent_checkpoint_id,
+                }
+            }
+
+        checkpoint = checkpoint_event.checkpoint_data.copy()
+        channel_values = {}
+        for channel, version in checkpoint.get("channel_versions", {}).items():
+            if (channel, version) in channel_data:
+                channel_values[channel] = channel_data[(channel, version)]
+
+        # NOTE: We intentionally skip patch_orphan_tool_calls here.
+        # Orphaned frontend tool_calls are handled in langgraph_default_merge_state
+        # by filtering stray ToolMessages instead.
+
+        checkpoint["channel_values"] = channel_values
+
+        return CheckpointTuple(
+            config={
+                "configurable": {
+                    "thread_id": config.thread_id,
+                    "actor_id": config.actor_id,
+                    "checkpoint_ns": config.checkpoint_ns,
+                    "checkpoint_id": checkpoint_event.checkpoint_id,
+                }
+            },
+            checkpoint=checkpoint,
+            metadata=checkpoint_event.metadata,
+            parent_config=parent_config,
+            pending_writes=pending_writes,
+        )
+
+
+class CopilotKitMemorySaver(AgentCoreMemorySaver):
+    """AgentCoreMemorySaver that skips patch_orphan_tool_calls entirely."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.processor = _NoPatchEventProcessor(self.processor)
+
+
+def _build_checkpointer() -> CopilotKitMemorySaver:
     memory_id = os.environ.get("MEMORY_ID")
     if not memory_id:
         raise ValueError("MEMORY_ID environment variable is required")
 
-    return AgentCoreMemorySaver(
+    return CopilotKitMemorySaver(
         memory_id=memory_id,
         region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
     )
 
 
 def _build_agui_graph():
-    return create_agent(
-        model=_build_model(streaming=False),
+    graph = create_agent(
+        model=_build_model(streaming=True),
         tools=[query_data, *TODO_TOOLS],
         checkpointer=_build_checkpointer(),
         middleware=[CopilotKitMiddleware()],
         state_schema=AgentState,
         system_prompt=SYSTEM_PROMPT,
     )
+    return graph
 
 
 @app.on_event("startup")
@@ -338,10 +555,8 @@ async def startup_event() -> None:
             description="LangGraph single agent exposed via AG-UI",
             graph=graph,
         )
-        logger.info("[STARTUP] AG-UI endpoint mounted at POST /invocations")
     except Exception as exc:
-        logger.error("[STARTUP ERROR] Failed to initialize AG-UI graph: %s", exc)
-        traceback.print_exc()
+        logger.error("[STARTUP ERROR] %s", exc)
         raise
 
 
@@ -371,15 +586,6 @@ async def _handle_agui(payload: dict[str, Any], request: Request):
             ),
         )
 
-    logger.info(
-        "[AGUI] received thread_id=%s run_id=%s actor_id=%s messages=%s tools=%s",
-        thread_id,
-        run_id,
-        actor_id,
-        len(getattr(input_data, "messages", []) or []),
-        len(getattr(input_data, "tools", []) or []),
-    )
-
     base_agent = cast(ActorAwareLangGraphAgent, app.state.agui_agent)
     request_agent = ActorAwareLangGraphAgent(
         name=base_agent.name,
@@ -391,85 +597,29 @@ async def _handle_agui(payload: dict[str, Any], request: Request):
     encoder = EventEncoder(accept=request.headers.get("accept"))
 
     async def event_generator():
-        event_count = 0
         saw_terminal_event = False
 
         try:
             async for event in request_agent.run(input_data):
-                event_count += 1
-                if isinstance(event, dict):
-                    event_type_raw = event.get("type")
-                else:
-                    event_type_raw = getattr(event, "type", None)
-                if hasattr(event_type_raw, "value"):
-                    event_type = str(event_type_raw.value)
-                elif event_type_raw:
-                    event_type = str(event_type_raw)
-                else:
-                    event_type = "UNKNOWN"
-
-                if event_type in {
-                    "RUN_STARTED",
-                    "RUN_FINISHED",
-                    "RUN_ERROR",
-                    "TOOL_CALL_START",
-                    "TOOL_CALL_RESULT",
-                }:
-                    logger.info(
-                        "[AGUI] event thread_id=%s run_id=%s event=%s count=%s",
-                        thread_id,
-                        run_id,
-                        event_type,
-                        event_count,
-                    )
-
+                event_type = getattr(getattr(event, "type", None), "value", None) \
+                    or (event.get("type") if isinstance(event, dict) else None)
                 if event_type in {"RUN_FINISHED", "RUN_ERROR"}:
                     saw_terminal_event = True
-
                 yield encoder.encode(event)
+        except asyncio.CancelledError:
+            return
         except Exception as exc:
-            if isinstance(exc, asyncio.CancelledError):
-                logger.info(
-                    "[AGUI] stream cancelled thread_id=%s run_id=%s",
-                    thread_id,
-                    run_id,
-                )
-                return
             saw_terminal_event = True
-            logger.exception(
-                "[AGUI] stream failure thread_id=%s run_id=%s error=%s",
-                thread_id,
-                run_id,
-                exc,
-            )
+            logger.exception("[AGUI] stream failure thread_id=%s run_id=%s", thread_id, run_id)
             yield encoder.encode(
                 RunErrorEvent(
-                    message=str(exc) or type(exc).__name__,
+                    message=f"{type(exc).__name__}: {exc}\n\n{traceback.format_exc()}",
                     code=type(exc).__name__,
                 )
             )
 
         if not saw_terminal_event:
-            logger.error(
-                "[AGUI] missing terminal event thread_id=%s run_id=%s total_events=%s",
-                thread_id,
-                run_id,
-                event_count,
-            )
-            yield encoder.encode(
-                RunFinishedEvent(
-                    threadId=thread_id,
-                    runId=run_id,
-                )
-            )
-
-        logger.info(
-            "[AGUI] stream completed thread_id=%s run_id=%s total_events=%s terminal=%s",
-            thread_id,
-            run_id,
-            event_count,
-            saw_terminal_event,
-        )
+            yield encoder.encode(RunFinishedEvent(threadId=thread_id, runId=run_id))
 
     return StreamingResponse(event_generator(), media_type=encoder.get_content_type())
 
