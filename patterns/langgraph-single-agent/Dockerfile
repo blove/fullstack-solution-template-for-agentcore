@@ -29,7 +29,7 @@ USER bedrock_agentcore
 
 EXPOSE 8080
 
-# Copy agent code (cache-bust: v21 - revert logging cleanup)
+# Copy agent code
 COPY patterns/langgraph-single-agent/langgraph_agent.py .
 COPY patterns/langgraph-single-agent/db.csv .
 
