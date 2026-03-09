@@ -14,34 +14,6 @@ import uuid
 from pathlib import Path
 from typing import Any, Literal, TypedDict, cast
 
-# Fix OpenTelemetry bugs with streaming Bedrock tool calls.
-# Individual function patches (belt-and-suspenders with the _process_event safety net).
-try:
-    from opentelemetry.instrumentation.botocore.extensions import bedrock_utils as _bu
-
-    _orig_decode = _bu._decode_tool_use
-
-    def _safe_decode_tool_use(tool_use):
-        if isinstance(tool_use.get("input"), dict):
-            return
-        _orig_decode(tool_use)
-
-    _bu._decode_tool_use = _safe_decode_tool_use
-
-    _orig_extract = _bu.extract_tool_calls
-
-    def _safe_extract_tool_calls(message, capture_content):
-        content = message.get("content") if isinstance(message, dict) else None
-        if not content:
-            return None
-        if isinstance(content, list):
-            message = {**message, "content": [c for c in content if c is not None]}
-        return _orig_extract(message, capture_content)
-
-    _bu.extract_tool_calls = _safe_extract_tool_calls
-except Exception:
-    pass
-
 
 
 # Fix langchain-aws + CopilotKit streaming bugs for the Converse API:
