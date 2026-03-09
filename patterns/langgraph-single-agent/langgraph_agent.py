@@ -59,20 +59,7 @@ try:
             if not (isinstance(msg, _ToolMessage) and msg.tool_call_id not in all_tc_ids)
         ]
 
-        result = _orig_messages_to_bedrock(messages)
-        # Fix string toolUse.input values from streaming
-        for bedrock_msg in result[0]:
-            for block in bedrock_msg.get("content", []):
-                if "toolUse" in block:
-                    inp = block["toolUse"].get("input")
-                    if isinstance(inp, str):
-                        try:
-                            block["toolUse"]["input"] = json.loads(inp) if inp else {}
-                        except (json.JSONDecodeError, TypeError):
-                            block["toolUse"]["input"] = {}
-                    elif inp is None:
-                        block["toolUse"]["input"] = {}
-        return result
+        return _orig_messages_to_bedrock(messages)
 
     _bc._messages_to_bedrock = _patched_messages_to_bedrock
 except Exception:
