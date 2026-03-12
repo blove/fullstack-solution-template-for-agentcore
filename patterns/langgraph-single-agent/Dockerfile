@@ -29,7 +29,11 @@ USER bedrock_agentcore
 
 EXPOSE 8080
 
-# Copy only the agent code
+# Copy local SDKs (replaces pip packages) - v21
+COPY ag_ui_langgraph/ ag_ui_langgraph/
+COPY copilotkit/ copilotkit/
+
+# Copy agent code
 COPY patterns/langgraph-single-agent/langgraph_agent.py .
 COPY patterns/langgraph-single-agent/db.csv .
 

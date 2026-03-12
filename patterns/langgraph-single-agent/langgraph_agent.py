@@ -3,29 +3,25 @@
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import csv
 import json
 import logging
 import os
-import traceback
 import uuid
 from pathlib import Path
-from typing import Any, Literal, TypedDict, cast
+from typing import Any, Literal, TypedDict
 
 import uvicorn
-from ag_ui.core import RunAgentInput, RunErrorEvent, RunFinishedEvent
-from ag_ui.encoder import EventEncoder
-from ag_ui_langgraph import LangGraphAgent
+from ag_ui.core import RunAgentInput
+from ag_ui_langgraph import add_langgraph_fastapi_endpoint
+from copilotkit import LangGraphAGUIAgent
 from copilotkit import CopilotKitMiddleware
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI
 from langchain.agents import create_agent
 from langchain.tools import ToolRuntime, tool
 from langchain_aws import ChatBedrock
 from langchain_core.messages import ToolMessage
-from langchain_core.runnables.config import ensure_config
 from langgraph.types import Command
 from langgraph_checkpoint_aws import AgentCoreMemorySaver
 
@@ -108,11 +104,6 @@ def query_data(query: str) -> dict[str, Any]:
     """
     Query the database. Always call this before showing a chart or graph.
     """
-    query_preview = (query or "").strip().replace("\n", " ")
-    if len(query_preview) > 200:
-        query_preview = f"{query_preview[:200]}..."
-    logger.info("[TOOL query_data] start query=%s", query_preview or "<empty>")
-
     # Copy row dicts so callers cannot mutate module-level cached data.
     rows = [dict(row) for row in _CACHED_ROWS]
     query_lower = query.lower()
@@ -140,12 +131,6 @@ def query_data(query: str) -> dict[str, Any]:
         "raw_row_count": len(rows),
     }
 
-    logger.info(
-        "[TOOL query_data] end selected_view=%s points=%s raw_row_count=%s",
-        selected_view,
-        len(data),
-        len(rows),
-    )
     return result
 
 
@@ -165,6 +150,7 @@ def manage_todos(todos: list[Todo], runtime: ToolRuntime) -> Command:
                 ToolMessage(
                     content="Successfully updated todos",
                     tool_call_id=runtime.tool_call_id,
+                    name="manage_todos",
                 ),
             ],
         }
@@ -251,60 +237,24 @@ def _build_model(streaming: bool) -> ChatBedrock:
     return ChatBedrock(
         model_id="us.anthropic.claude-sonnet-4-5-20250929-v1:0",
         temperature=0.1,
+        max_tokens=16384,
         streaming=streaming,
+        beta_use_converse_api=True,
     )
 
 
-class ActorAwareLangGraphAgent(LangGraphAgent):
-    def langgraph_default_merge_state(
-        self, state: dict[str, Any], messages: list[Any], input: RunAgentInput
-    ) -> dict[str, Any]:
-        merged_state = super().langgraph_default_merge_state(state, messages, input)
-        tools = merged_state.get("tools", [])
-        copilotkit_state = merged_state.get("copilotkit", {})
-        if not isinstance(copilotkit_state, dict):
-            copilotkit_state = {}
-
-        # CopilotKitMiddleware expects frontend tools under state.copilotkit.actions.
-        merged_state["copilotkit"] = {
-            **copilotkit_state,
-            "actions": tools,
-            "context": input.context or [],
-        }
-        return merged_state
-
-    async def get_checkpoint_before_message(self, message_id: str, thread_id: str):
-        if not thread_id:
-            raise ValueError("Missing thread_id in config")
-
-        config = ensure_config(self.config.copy() if self.config else {})
-        configurable = dict(config.get("configurable", {}))
-        configurable["thread_id"] = thread_id
-
-        history_list = []
-        async for snapshot in self.graph.aget_state_history(
-            {"configurable": configurable}
-        ):
-            history_list.append(snapshot)
-
-        history_list.reverse()
-        for idx, snapshot in enumerate(history_list):
-            messages = snapshot.values.get("messages", [])
-            if any(getattr(m, "id", None) == message_id for m in messages):
-                if idx == 0:
-                    empty_snapshot = snapshot
-                    empty_snapshot.values["messages"] = []
-                    return empty_snapshot
-
-                snapshot_values_without_messages = snapshot.values.copy()
-                del snapshot_values_without_messages["messages"]
-                checkpoint = history_list[idx - 1]
-
-                merged_values = {**checkpoint.values, **snapshot_values_without_messages}
-                checkpoint = checkpoint._replace(values=merged_values)
-                return checkpoint
-
-        raise ValueError("Message ID not found in history")
+class ActorAwareLangGraphAgent(LangGraphAGUIAgent):
+    async def run(self, input: RunAgentInput):
+        """Inject actor_id from forwarded_props into config per-request."""
+        actor_id = resolve_actor_id(input, None)
+        if not actor_id:
+            raise ValueError(
+                "Missing actor identity. Provide forwardedProps.actor_id/user_id "
+                "or include sub claim in forwarded props."
+            )
+        self.config = {"configurable": {"actor_id": actor_id}}
+        async for event in super().run(input):
+            yield event
 
 
 def _build_checkpointer() -> AgentCoreMemorySaver:
@@ -319,30 +269,15 @@ def _build_checkpointer() -> AgentCoreMemorySaver:
 
 
 def _build_agui_graph():
-    return create_agent(
-        model=_build_model(streaming=False),
+    graph = create_agent(
+        model=_build_model(streaming=True),
         tools=[query_data, *TODO_TOOLS],
         checkpointer=_build_checkpointer(),
         middleware=[CopilotKitMiddleware()],
         state_schema=AgentState,
         system_prompt=SYSTEM_PROMPT,
     )
-
-
-@app.on_event("startup")
-async def startup_event() -> None:
-    try:
-        graph = _build_agui_graph()
-        app.state.agui_agent = ActorAwareLangGraphAgent(
-            name="LangGraphSingleAgent",
-            description="LangGraph single agent exposed via AG-UI",
-            graph=graph,
-        )
-        logger.info("[STARTUP] AG-UI endpoint mounted at POST /invocations")
-    except Exception as exc:
-        logger.error("[STARTUP ERROR] Failed to initialize AG-UI graph: %s", exc)
-        traceback.print_exc()
-        raise
+    return graph
 
 
 @app.get("/ping")
@@ -350,151 +285,19 @@ async def ping() -> dict[str, str]:
     return {"status": "Healthy"}
 
 
-async def _handle_agui(payload: dict[str, Any], request: Request):
+@app.on_event("startup")
+async def startup_event() -> None:
     try:
-        input_data = RunAgentInput.model_validate(payload)
+        graph = _build_agui_graph()
+        agent = ActorAwareLangGraphAgent(
+            name="LangGraphSingleAgent",
+            description="LangGraph single agent exposed via AG-UI",
+            graph=graph,
+        )
+        add_langgraph_fastapi_endpoint(app, agent, path="/invocations")
     except Exception as exc:
-        raise HTTPException(
-            status_code=400, detail=f"Invalid AG-UI payload: {exc}"
-        ) from exc
-
-    thread_id = getattr(input_data, "thread_id", None) or "unknown"
-    run_id = getattr(input_data, "run_id", None) or "unknown"
-    actor_id = resolve_actor_id(input_data, request.headers.get("authorization"))
-
-    if not actor_id:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Missing actor identity. Provide forwardedProps.actor_id/user_id "
-                "or Authorization Bearer token with sub claim."
-            ),
-        )
-
-    logger.info(
-        "[AGUI] received thread_id=%s run_id=%s actor_id=%s messages=%s tools=%s",
-        thread_id,
-        run_id,
-        actor_id,
-        len(getattr(input_data, "messages", []) or []),
-        len(getattr(input_data, "tools", []) or []),
-    )
-
-    base_agent = cast(ActorAwareLangGraphAgent, app.state.agui_agent)
-    request_agent = ActorAwareLangGraphAgent(
-        name=base_agent.name,
-        description=base_agent.description,
-        graph=base_agent.graph,
-        config={"configurable": {"actor_id": actor_id}},
-    )
-
-    encoder = EventEncoder(accept=request.headers.get("accept"))
-
-    async def event_generator():
-        event_count = 0
-        saw_terminal_event = False
-
-        try:
-            async for event in request_agent.run(input_data):
-                event_count += 1
-                if isinstance(event, dict):
-                    event_type_raw = event.get("type")
-                else:
-                    event_type_raw = getattr(event, "type", None)
-                if hasattr(event_type_raw, "value"):
-                    event_type = str(event_type_raw.value)
-                elif event_type_raw:
-                    event_type = str(event_type_raw)
-                else:
-                    event_type = "UNKNOWN"
-
-                if event_type in {
-                    "RUN_STARTED",
-                    "RUN_FINISHED",
-                    "RUN_ERROR",
-                    "TOOL_CALL_START",
-                    "TOOL_CALL_RESULT",
-                }:
-                    logger.info(
-                        "[AGUI] event thread_id=%s run_id=%s event=%s count=%s",
-                        thread_id,
-                        run_id,
-                        event_type,
-                        event_count,
-                    )
-
-                if event_type in {"RUN_FINISHED", "RUN_ERROR"}:
-                    saw_terminal_event = True
-
-                yield encoder.encode(event)
-        except Exception as exc:
-            if isinstance(exc, asyncio.CancelledError):
-                logger.info(
-                    "[AGUI] stream cancelled thread_id=%s run_id=%s",
-                    thread_id,
-                    run_id,
-                )
-                return
-            saw_terminal_event = True
-            logger.exception(
-                "[AGUI] stream failure thread_id=%s run_id=%s error=%s",
-                thread_id,
-                run_id,
-                exc,
-            )
-            yield encoder.encode(
-                RunErrorEvent(
-                    message=str(exc) or type(exc).__name__,
-                    code=type(exc).__name__,
-                )
-            )
-
-        if not saw_terminal_event:
-            logger.error(
-                "[AGUI] missing terminal event thread_id=%s run_id=%s total_events=%s",
-                thread_id,
-                run_id,
-                event_count,
-            )
-            yield encoder.encode(
-                RunFinishedEvent(
-                    threadId=thread_id,
-                    runId=run_id,
-                )
-            )
-
-        logger.info(
-            "[AGUI] stream completed thread_id=%s run_id=%s total_events=%s terminal=%s",
-            thread_id,
-            run_id,
-            event_count,
-            saw_terminal_event,
-        )
-
-    return StreamingResponse(event_generator(), media_type=encoder.get_content_type())
-
-
-@app.post("/invocations")
-async def invocations(request: Request):
-    try:
-        payload = await request.json()
-    except Exception as exc:
-        raise HTTPException(
-            status_code=400, detail=f"Invalid JSON body: {exc}"
-        ) from exc
-
-    if not isinstance(payload, dict):
-        raise HTTPException(
-            status_code=400, detail="Request body must be a JSON object"
-        )
-
-    return await _handle_agui(payload, request)
-
-
-@app.get("/invocations/health")
-async def invocations_health() -> dict[str, Any]:
-    base_agent = cast(LangGraphAgent, app.state.agui_agent)
-    return {"status": "ok", "agent": {"name": base_agent.name}}
+        logger.error("[STARTUP ERROR] %s", exc)
+        raise
 
 
 if __name__ == "__main__":
