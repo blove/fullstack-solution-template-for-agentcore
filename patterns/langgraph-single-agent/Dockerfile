@@ -29,7 +29,7 @@ USER bedrock_agentcore
 
 EXPOSE 8080
 
-# Copy local SDKs (replaces pip packages) - v4
+# Copy local SDKs (replaces pip packages) - v5
 COPY ag_ui_langgraph/ ag_ui_langgraph/
 COPY copilotkit/ copilotkit/
 
