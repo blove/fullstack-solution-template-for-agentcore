@@ -18,7 +18,7 @@ except ImportError:
     from langchain_core.messages import BaseMessage, SystemMessage
     
 from langchain_core.runnables import RunnableConfig, ensure_config
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import HumanMessage
 
 from partialjson.json_parser import JSONParser
 
@@ -71,41 +71,14 @@ def langgraph_default_merge_state( # pylint: disable=unused-argument
         agent_name: str
     ):
     """Default merge state for LangGraph"""
-    import logging
-    _log = logging.getLogger("copilotkit.merge")
-
     if len(messages) > 0 and isinstance(messages[0], SystemMessage):
+        # remove system message
         messages = messages[1:]
 
-    existing = state.get("messages", [])
-    existing_ids = {m.id for m in existing}
-    new = [m for m in messages if m.id not in existing_ids]
+    existing_messages = state.get("messages", [])
+    existing_message_ids = {message.id for message in existing_messages}
 
-    _log.info("[MERGE] existing=%d incoming=%d new=%d",
-              len(existing), len(messages), len(new))
-    for m in existing:
-        tc_info = getattr(m, "tool_calls", None) or getattr(m, "tool_call_id", None)
-        _log.info("[MERGE]   existing: %s id=%s tc=%s", type(m).__name__, m.id, tc_info)
-    for m in new:
-        tc_info = getattr(m, "tool_calls", None) or getattr(m, "tool_call_id", None)
-        _log.info("[MERGE]   new: %s id=%s tc=%s", type(m).__name__, m.id, tc_info)
-
-    # Insert late-arriving ToolMessages next to their parent AIMessage
-    # instead of appending at the end (which breaks Bedrock Converse API).
-    # Reverse iteration avoids index-shifting bookkeeping.
-    pending = {m.tool_call_id: m for m in new if isinstance(m, ToolMessage)}
-    _log.info("[MERGE] pending ToolMessages: %s", list(pending.keys()))
-
-    for i in range(len(existing) - 1, -1, -1):
-        if isinstance(existing[i], AIMessage):
-            for tc in reversed(existing[i].tool_calls or []):
-                if tc["id"] in pending:
-                    _log.info("[MERGE] inserting ToolMessage for tc=%s after existing[%d]", tc["id"], i)
-                    existing.insert(i + 1, pending.pop(tc["id"]))
-
-    new_messages = [m for m in new if not isinstance(m, ToolMessage) or m.tool_call_id in pending]
-    _log.info("[MERGE] result: new_messages=%d, unmatched pending=%s",
-              len(new_messages), list(pending.keys()))
+    new_messages = [message for message in messages if message.id not in existing_message_ids]
 
     return {
         **state,
