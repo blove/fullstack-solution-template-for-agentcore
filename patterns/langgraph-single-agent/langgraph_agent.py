@@ -26,7 +26,7 @@ from langgraph.types import Command
 from langgraph.checkpoint.base import CheckpointTuple
 from langgraph_checkpoint_aws import AgentCoreMemorySaver
 
-BUILD_VERSION = "2026-03-12d"
+BUILD_VERSION = "2026-03-12i"
 
 logger = logging.getLogger("langgraph_single_agent")
 if not logging.getLogger().handlers:
@@ -336,7 +336,7 @@ def _build_checkpointer() -> CopilotKitMemorySaver:
     if not memory_id:
         raise ValueError("MEMORY_ID environment variable is required")
 
-    return CopilotKitMemorySaver(
+    return AgentCoreMemorySaver(
         memory_id=memory_id,
         region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
     )

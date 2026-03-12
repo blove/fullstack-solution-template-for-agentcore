@@ -1,3 +1,4 @@
+import re
 import uuid
 import json
 from typing import Optional, List, Any, Union, AsyncGenerator, Generator, Literal, Dict
@@ -258,10 +259,11 @@ class LangGraphAgent:
             StateSnapshotEvent(type=EventType.STATE_SNAPSHOT, snapshot=self.get_state_snapshot(state_values))
         )
 
+        snapshot_messages = self._filter_orphan_tool_messages(state_values.get("messages", []))
         yield self._dispatch_event(
             MessagesSnapshotEvent(
                 type=EventType.MESSAGES_SNAPSHOT,
-                messages=langchain_messages_to_agui(state_values.get("messages", [])),
+                messages=langchain_messages_to_agui(snapshot_messages),
             )
         )
 
@@ -452,9 +454,47 @@ class LangGraphAgent:
             messages = messages[1:]
 
         existing_messages: List[LangGraphPlatformMessage] = state.get("messages", [])
+
+        # Fix orphan ToolMessages injected by patch_orphan_tool_calls:
+        # Find the real content from AG-UI messages and replace the fake content.
+        # Only scan from the last HumanMessage to the end of existing_messages.
+        # Track replaced tool_call_ids so we don't also add the AG-UI duplicate.
+        agui_tool_content = {
+            m.tool_call_id: m.content
+            for m in messages
+            if isinstance(m, ToolMessage) and hasattr(m, 'tool_call_id')
+        }
+        replaced_tool_call_ids = set()
+        if agui_tool_content:
+            last_human_idx = -1
+            for i in range(len(existing_messages) - 1, -1, -1):
+                if isinstance(existing_messages[i], HumanMessage):
+                    last_human_idx = i
+                    break
+            if last_human_idx >= 0:
+                for i in range(last_human_idx + 1, len(existing_messages)):
+                    msg = existing_messages[i]
+                    if (
+                        isinstance(msg, ToolMessage)
+                        and isinstance(msg.content, str)
+                        and self._ORPHAN_TOOL_MSG_RE.match(msg.content)
+                        and hasattr(msg, 'tool_call_id')
+                        and msg.tool_call_id in agui_tool_content
+                    ):
+                        msg.content = agui_tool_content[msg.tool_call_id]
+                        replaced_tool_call_ids.add(msg.tool_call_id)
+
         existing_message_ids = {msg.id for msg in existing_messages}
 
-        new_messages = [msg for msg in messages if msg.id not in existing_message_ids]
+        new_messages = [
+            msg for msg in messages
+            if msg.id not in existing_message_ids
+            and not (
+                isinstance(msg, ToolMessage)
+                and hasattr(msg, 'tool_call_id')
+                and msg.tool_call_id in replaced_tool_call_ids
+            )
+        ]
 
         tools = input.tools or []
         tools_as_dicts = []
@@ -494,6 +534,36 @@ class LangGraphAgent:
                 "actions": unique_tools,
             },
         }
+
+    _ORPHAN_TOOL_MSG_RE = re.compile(
+        r"^Tool call '.+' with id '.+' was interrupted before completion\.$"
+    )
+
+    def _filter_orphan_tool_messages(self, messages: list) -> list:
+        """Remove fake ToolMessages injected by patch_orphan_tool_calls,
+        but only between the last user message and the end of the list."""
+        # Find the index of the last HumanMessage
+        last_human_idx = -1
+        for i in range(len(messages) - 1, -1, -1):
+            if isinstance(messages[i], HumanMessage):
+                last_human_idx = i
+                break
+
+        if last_human_idx == -1:
+            return messages
+
+        # Keep everything before the last user message as-is,
+        # filter the tail
+        head = messages[:last_human_idx + 1]
+        tail = [
+            m for m in messages[last_human_idx + 1:]
+            if not (
+                isinstance(m, ToolMessage)
+                and isinstance(m.content, str)
+                and self._ORPHAN_TOOL_MSG_RE.match(m.content)
+            )
+        ]
+        return head + tail
 
     def get_state_snapshot(self, state: State) -> State:
         schema_keys = self.active_run["schema_keys"]
