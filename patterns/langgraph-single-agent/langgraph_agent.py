@@ -26,7 +26,7 @@ from langgraph.types import Command
 from langgraph.checkpoint.base import CheckpointTuple
 from langgraph_checkpoint_aws import AgentCoreMemorySaver
 
-BUILD_VERSION = "2026-03-12i"
+BUILD_VERSION = "2026-03-12r"
 
 logger = logging.getLogger("langgraph_single_agent")
 if not logging.getLogger().handlers:
