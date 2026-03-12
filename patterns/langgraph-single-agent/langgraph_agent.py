@@ -78,7 +78,7 @@ except Exception:
 import uvicorn
 from ag_ui.core import RunAgentInput, RunErrorEvent, RunFinishedEvent
 from ag_ui.encoder import EventEncoder
-from ag_ui_langgraph import LangGraphAgent
+from ag_ui_langgraph import LangGraphAgent, add_langgraph_fastapi_endpoint
 from copilotkit import CopilotKitMiddleware
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -315,6 +315,19 @@ class ActorAwareLangGraphAgent(LangGraphAgent):
         current = self.messages_in_process.get(run_id) or {}
         self.messages_in_process[run_id] = {**current, **data}
 
+    async def run(self, input: RunAgentInput):
+        """Inject actor_id from forwarded_props into config per-request."""
+        actor_id = resolve_actor_id(input, None)
+        if not actor_id:
+            raise ValueError(
+                "Missing actor identity. Provide forwardedProps.actor_id/user_id "
+                "or include sub claim in forwarded props."
+            )
+        self.config = {"configurable": {"actor_id": actor_id}}
+        logger.info("[AGUI] using add_langgraph_fastapi_endpoint path, actor_id=%s", actor_id)
+        async for event in super().run(input):
+            yield event
+
     def langgraph_default_merge_state(
         self, state: dict[str, Any], messages: list[Any], input: RunAgentInput
     ) -> dict[str, Any]:
@@ -546,105 +559,24 @@ def _build_agui_graph():
     return graph
 
 
-@app.on_event("startup")
-async def startup_event() -> None:
-    try:
-        graph = _build_agui_graph()
-        app.state.agui_agent = ActorAwareLangGraphAgent(
-            name="LangGraphSingleAgent",
-            description="LangGraph single agent exposed via AG-UI",
-            graph=graph,
-        )
-    except Exception as exc:
-        logger.error("[STARTUP ERROR] %s", exc)
-        raise
-
-
 @app.get("/ping")
 async def ping() -> dict[str, str]:
     return {"status": "Healthy"}
 
 
-async def _handle_agui(payload: dict[str, Any], request: Request):
+@app.on_event("startup")
+async def startup_event() -> None:
     try:
-        input_data = RunAgentInput.model_validate(payload)
-    except Exception as exc:
-        raise HTTPException(
-            status_code=400, detail=f"Invalid AG-UI payload: {exc}"
-        ) from exc
-
-    thread_id = getattr(input_data, "thread_id", None) or "unknown"
-    run_id = getattr(input_data, "run_id", None) or "unknown"
-    actor_id = resolve_actor_id(input_data, request.headers.get("authorization"))
-
-    if not actor_id:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Missing actor identity. Provide forwardedProps.actor_id/user_id "
-                "or Authorization Bearer token with sub claim."
-            ),
+        graph = _build_agui_graph()
+        agent = ActorAwareLangGraphAgent(
+            name="LangGraphSingleAgent",
+            description="LangGraph single agent exposed via AG-UI",
+            graph=graph,
         )
-
-    base_agent = cast(ActorAwareLangGraphAgent, app.state.agui_agent)
-    request_agent = ActorAwareLangGraphAgent(
-        name=base_agent.name,
-        description=base_agent.description,
-        graph=base_agent.graph,
-        config={"configurable": {"actor_id": actor_id}},
-    )
-
-    encoder = EventEncoder(accept=request.headers.get("accept"))
-
-    async def event_generator():
-        saw_terminal_event = False
-
-        try:
-            async for event in request_agent.run(input_data):
-                event_type = getattr(getattr(event, "type", None), "value", None) \
-                    or (event.get("type") if isinstance(event, dict) else None)
-                if event_type in {"RUN_FINISHED", "RUN_ERROR"}:
-                    saw_terminal_event = True
-                yield encoder.encode(event)
-        except asyncio.CancelledError:
-            return
-        except Exception as exc:
-            saw_terminal_event = True
-            logger.exception("[AGUI] stream failure thread_id=%s run_id=%s", thread_id, run_id)
-            yield encoder.encode(
-                RunErrorEvent(
-                    message=f"{type(exc).__name__}: {exc}\n\n{traceback.format_exc()}",
-                    code=type(exc).__name__,
-                )
-            )
-
-        if not saw_terminal_event:
-            yield encoder.encode(RunFinishedEvent(threadId=thread_id, runId=run_id))
-
-    return StreamingResponse(event_generator(), media_type=encoder.get_content_type())
-
-
-@app.post("/invocations")
-async def invocations(request: Request):
-    try:
-        payload = await request.json()
+        add_langgraph_fastapi_endpoint(app, agent, path="/invocations")
     except Exception as exc:
-        raise HTTPException(
-            status_code=400, detail=f"Invalid JSON body: {exc}"
-        ) from exc
-
-    if not isinstance(payload, dict):
-        raise HTTPException(
-            status_code=400, detail="Request body must be a JSON object"
-        )
-
-    return await _handle_agui(payload, request)
-
-
-@app.get("/invocations/health")
-async def invocations_health() -> dict[str, Any]:
-    base_agent = cast(LangGraphAgent, app.state.agui_agent)
-    return {"status": "ok", "agent": {"name": base_agent.name}}
+        logger.error("[STARTUP ERROR] %s", exc)
+        raise
 
 
 if __name__ == "__main__":
