@@ -78,7 +78,8 @@ except Exception:
 import uvicorn
 from ag_ui.core import RunAgentInput, RunErrorEvent, RunFinishedEvent
 from ag_ui.encoder import EventEncoder
-from ag_ui_langgraph import LangGraphAgent, add_langgraph_fastapi_endpoint
+from ag_ui_langgraph import add_langgraph_fastapi_endpoint
+from copilotkit import LangGraphAGUIAgent
 from copilotkit import CopilotKitMiddleware
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -309,7 +310,7 @@ def _build_model(streaming: bool) -> ChatBedrock:
     )
 
 
-class ActorAwareLangGraphAgent(LangGraphAgent):
+class ActorAwareLangGraphAgent(LangGraphAGUIAgent):
     def set_message_in_progress(self, run_id, data):
         """Fix ag_ui_langgraph bug: messages_in_process[run_id] can be None."""
         current = self.messages_in_process.get(run_id) or {}
