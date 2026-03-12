@@ -25,8 +25,6 @@ from langchain_core.messages import ToolMessage
 from langgraph.types import Command
 from langgraph_checkpoint_aws import AgentCoreMemorySaver
 
-BUILD_VERSION = "2026-03-12r"
-
 logger = logging.getLogger("langgraph_single_agent")
 if not logging.getLogger().handlers:
     logging.basicConfig(
@@ -34,7 +32,6 @@ if not logging.getLogger().handlers:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
 logger.setLevel(logging.INFO)
-logger.info("[BOOT] langgraph_single_agent version=%s", BUILD_VERSION)
 
 app = FastAPI()
 
@@ -256,7 +253,6 @@ class ActorAwareLangGraphAgent(LangGraphAGUIAgent):
                 "or include sub claim in forwarded props."
             )
         self.config = {"configurable": {"actor_id": actor_id}}
-        logger.info("[AGUI] run version=%s actor_id=%s thread_id=%s", BUILD_VERSION, actor_id, input.thread_id)
         async for event in super().run(input):
             yield event
 
