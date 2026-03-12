@@ -111,10 +111,11 @@ from langchain.agents import create_agent
 from langchain.tools import ToolRuntime, tool
 from langchain_aws import ChatBedrock
 from langchain_core.messages import AIMessage, ToolMessage
-from langchain_core.runnables.config import ensure_config
 from langgraph.types import Command
 from langgraph.checkpoint.base import CheckpointTuple
 from langgraph_checkpoint_aws import AgentCoreMemorySaver
+
+BUILD_VERSION = "2026-03-12b"
 
 logger = logging.getLogger("langgraph_single_agent")
 if not logging.getLogger().handlers:
@@ -123,6 +124,7 @@ if not logging.getLogger().handlers:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
 logger.setLevel(logging.INFO)
+logger.info("[BOOT] langgraph_single_agent version=%s", BUILD_VERSION)
 
 app = FastAPI()
 
@@ -348,38 +350,6 @@ class ActorAwareLangGraphAgent(LangGraphAGUIAgent):
         async for event in super().run(input):
             yield event
 
-    async def get_checkpoint_before_message(self, message_id: str, thread_id: str):
-        if not thread_id:
-            raise ValueError("Missing thread_id in config")
-
-        config = ensure_config(self.config.copy() if self.config else {})
-        configurable = dict(config.get("configurable", {}))
-        configurable["thread_id"] = thread_id
-
-        history_list = []
-        async for snapshot in self.graph.aget_state_history(
-            {"configurable": configurable}
-        ):
-            history_list.append(snapshot)
-
-        history_list.reverse()
-        for idx, snapshot in enumerate(history_list):
-            messages = snapshot.values.get("messages", [])
-            if any(getattr(m, "id", None) == message_id for m in messages):
-                if idx == 0:
-                    empty_snapshot = snapshot
-                    empty_snapshot.values["messages"] = []
-                    return empty_snapshot
-
-                snapshot_values_without_messages = snapshot.values.copy()
-                del snapshot_values_without_messages["messages"]
-                checkpoint = history_list[idx - 1]
-
-                merged_values = {**checkpoint.values, **snapshot_values_without_messages}
-                checkpoint = checkpoint._replace(values=merged_values)
-                return checkpoint
-
-        raise ValueError("Message ID not found in history")
 
 
 class _NoPatchEventProcessor:
