@@ -3,119 +3,30 @@
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import csv
 import json
 import logging
 import os
-import traceback
 import uuid
 from pathlib import Path
-from typing import Any, Literal, TypedDict, cast
-
-
-
-# Fix CopilotKit + Bedrock Converse API compatibility:
-# 1. Sync content blocks with tool_calls (CopilotKit after_model strips tool_calls)
-# 2. Reorder ToolMessages to sit right after their parent AIMessage (Bedrock requires it)
-# 3. Strip orphaned ToolMessages and unanswered tool_calls
-try:
-    import langchain_aws.chat_models.bedrock_converse as _bc
-    from langchain_core.messages import AIMessage as _AIMessage, ToolMessage as _ToolMessage
-
-    _orig_messages_to_bedrock = _bc._messages_to_bedrock
-    _patch_log = logging.getLogger("bedrock_patch")
-
-    def _patched_messages_to_bedrock(messages):
-        _patch_log.info("[PATCH] input messages: %s",
-                        [(type(m).__name__, m.id,
-                          getattr(m, "tool_call_id", None) or [tc["id"] for tc in getattr(m, "tool_calls", []) or []])
-                         for m in messages])
-
-        # 1. Sync content with tool_calls: remove tool_use content blocks that
-        #    aren't in msg.tool_calls (stripped by CopilotKit after_model).
-        for msg in messages:
-            if isinstance(msg, _AIMessage) and isinstance(msg.content, list):
-                tc_ids = {tc["id"] for tc in (msg.tool_calls or [])}
-                msg.content = [
-                    block for block in msg.content
-                    if not (isinstance(block, dict) and block.get("type") == "tool_use"
-                            and block.get("id") not in tc_ids)
-                ]
-
-        # 2. Pull out all ToolMessages, then rebuild the list inserting each
-        #    ToolMessage right after the AIMessage that owns its tool_call_id.
-        tool_msgs = {m.tool_call_id: m for m in messages if isinstance(m, _ToolMessage)}
-        non_tool = [m for m in messages if not isinstance(m, _ToolMessage)]
-        reordered = []
-        answered_tc_ids = set()
-        for msg in non_tool:
-            reordered.append(msg)
-            if isinstance(msg, _AIMessage):
-                for tc in (msg.tool_calls or []):
-                    if tc["id"] in tool_msgs:
-                        reordered.append(tool_msgs[tc["id"]])
-                        answered_tc_ids.add(tc["id"])
-
-        # 3. Strip unanswered tool_calls from AIMessages (frontend tools with no
-        #    ToolMessage yet — Bedrock rejects toolUse without matching toolResult).
-        for msg in reordered:
-            if isinstance(msg, _AIMessage) and msg.tool_calls:
-                unanswered = [tc for tc in msg.tool_calls if tc["id"] not in answered_tc_ids]
-                if unanswered:
-                    _patch_log.info("[PATCH] stripping %d unanswered tool_calls: %s",
-                                   len(unanswered), [tc["id"] for tc in unanswered])
-                    msg.tool_calls = [tc for tc in msg.tool_calls if tc["id"] in answered_tc_ids]
-                    if isinstance(msg.content, list):
-                        unanswered_ids = {tc["id"] for tc in unanswered}
-                        msg.content = [
-                            block for block in msg.content
-                            if not (isinstance(block, dict) and block.get("type") == "tool_use"
-                                    and block.get("id") in unanswered_ids)
-                        ]
-
-        _patch_log.info("[PATCH] reordered messages: %s",
-                        [(type(m).__name__, m.id,
-                          getattr(m, "tool_call_id", None) or [tc["id"] for tc in getattr(m, "tool_calls", []) or []])
-                         for m in reordered])
-
-        result = _orig_messages_to_bedrock(reordered)
-        # Fix string toolUse.input values from streaming (stored in checkpoints)
-        for bedrock_msg in result[0]:
-            for block in bedrock_msg.get("content", []):
-                if "toolUse" in block:
-                    inp = block["toolUse"].get("input")
-                    if isinstance(inp, str):
-                        try:
-                            block["toolUse"]["input"] = json.loads(inp) if inp else {}
-                        except (json.JSONDecodeError, TypeError):
-                            block["toolUse"]["input"] = {}
-                    elif inp is None:
-                        block["toolUse"]["input"] = {}
-        return result
-
-    _bc._messages_to_bedrock = _patched_messages_to_bedrock
-except Exception:
-    pass
+from typing import Any, Literal, TypedDict
 
 import uvicorn
-from ag_ui.core import RunAgentInput, RunErrorEvent, RunFinishedEvent
-from ag_ui.encoder import EventEncoder
+from ag_ui.core import RunAgentInput
 from ag_ui_langgraph import add_langgraph_fastapi_endpoint
 from copilotkit import LangGraphAGUIAgent
 from copilotkit import CopilotKitMiddleware
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI
 from langchain.agents import create_agent
 from langchain.tools import ToolRuntime, tool
 from langchain_aws import ChatBedrock
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import ToolMessage
 from langgraph.types import Command
 from langgraph.checkpoint.base import CheckpointTuple
 from langgraph_checkpoint_aws import AgentCoreMemorySaver
 
-BUILD_VERSION = "2026-03-12b"
+BUILD_VERSION = "2026-03-12c"
 
 logger = logging.getLogger("langgraph_single_agent")
 if not logging.getLogger().handlers:
@@ -349,7 +260,6 @@ class ActorAwareLangGraphAgent(LangGraphAGUIAgent):
         logger.info("[AGUI] using add_langgraph_fastapi_endpoint path, actor_id=%s", actor_id)
         async for event in super().run(input):
             yield event
-
 
 
 class _NoPatchEventProcessor:
