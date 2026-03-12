@@ -1,11 +1,8 @@
-import logging
 import re
 import uuid
 import json
 from typing import Optional, List, Any, Union, AsyncGenerator, Generator, Literal, Dict
 import inspect
-
-_agui_log = logging.getLogger("ag_ui_langgraph")
 
 from langgraph.graph.state import CompiledStateGraph
 
@@ -153,9 +150,7 @@ class LangGraphAgent:
         else:
             self.active_run["mode"] = "start"
 
-        _agui_log.info("[RUN] preparing stream thread_id=%s", thread_id)
         prepared_stream_response = await self.prepare_stream(input=input, agent_state=agent_state, config=config)
-        _agui_log.info("[RUN] stream prepared")
 
         yield self._dispatch_event(
             RunStartedEvent(type=EventType.RUN_STARTED, thread_id=thread_id, run_id=self.active_run["id"])
@@ -188,7 +183,6 @@ class LangGraphAgent:
                     event.get("event", "").startswith("values")
                 ))
                 if event["event"] == "error":
-                    _agui_log.error("[RUN] stream error event: %s", event.get("data", {}).get("message", ""))
                     yield self._dispatch_event(
                         RunErrorEvent(type=EventType.RUN_ERROR, message=event["data"]["message"], raw_event=event)
                     )
@@ -235,7 +229,6 @@ class LangGraphAgent:
                 async for single_event in self._handle_single_event(event, state):
                     yield single_event
 
-            _agui_log.info("[RUN] stream loop finished, getting final state")
             state = await self.graph.aget_state(config)
 
             tasks = state.tasks if len(state.tasks) > 0 else None
@@ -278,14 +271,12 @@ class LangGraphAgent:
             for ev in self.handle_node_change(None):
                 yield ev
 
-            _agui_log.info("[RUN] emitting RUN_FINISHED")
             yield self._dispatch_event(
                 RunFinishedEvent(type=EventType.RUN_FINISHED, thread_id=thread_id, run_id=self.active_run["id"])
             )
             # Reset active run to how it was before the stream started
             self.active_run = INITIAL_ACTIVE_RUN
-        except Exception as exc:
-            _agui_log.error("[RUN] exception in stream: %s", exc, exc_info=True)
+        except Exception:
             raise
 
 
@@ -480,13 +471,6 @@ class LangGraphAgent:
                         except (json.JSONDecodeError, TypeError):
                             tc['args'] = {}
 
-        _agui_log.info("[MERGE] existing_messages count=%d types=%s",
-                       len(existing_messages),
-                       [(type(m).__name__, m.id, getattr(m, 'tool_call_id', None)) for m in existing_messages[-10:]])
-        _agui_log.info("[MERGE] agui messages count=%d types=%s",
-                       len(messages),
-                       [(type(m).__name__, m.id, getattr(m, 'tool_call_id', None)) for m in messages[-10:]])
-
         # Fix orphan ToolMessages injected by patch_orphan_tool_calls:
         # Find the real content from AG-UI messages and replace the fake content.
         # Only scan from the last HumanMessage to the end of existing_messages.
@@ -513,13 +497,8 @@ class LangGraphAgent:
                         and hasattr(msg, 'tool_call_id')
                         and msg.tool_call_id in agui_tool_content
                     ):
-                        _agui_log.info("[MERGE] replacing orphan ToolMessage tool_call_id=%s old_content=%s",
-                                       msg.tool_call_id, msg.content[:100])
                         msg.content = agui_tool_content[msg.tool_call_id]
                         replaced_tool_call_ids.add(msg.tool_call_id)
-
-        if replaced_tool_call_ids:
-            _agui_log.info("[MERGE] replaced_tool_call_ids=%s", replaced_tool_call_ids)
 
         existing_message_ids = {msg.id for msg in existing_messages}
 
@@ -532,10 +511,6 @@ class LangGraphAgent:
                 and msg.tool_call_id in replaced_tool_call_ids
             )
         ]
-
-        _agui_log.info("[MERGE] new_messages count=%d types=%s",
-                       len(new_messages),
-                       [(type(m).__name__, m.id, getattr(m, 'tool_call_id', None)) for m in new_messages[-10:]])
 
         tools = input.tools or []
         tools_as_dicts = []

@@ -23,7 +23,6 @@ from langchain.tools import ToolRuntime, tool
 from langchain_aws import ChatBedrock
 from langchain_core.messages import ToolMessage
 from langgraph.types import Command
-from langgraph.checkpoint.base import CheckpointTuple
 from langgraph_checkpoint_aws import AgentCoreMemorySaver
 
 BUILD_VERSION = "2026-03-12r"
@@ -262,76 +261,7 @@ class ActorAwareLangGraphAgent(LangGraphAGUIAgent):
             yield event
 
 
-class _NoPatchEventProcessor:
-    """EventProcessor that skips patch_orphan_tool_calls.
-
-    CopilotKit frontend tool calls are intentionally orphaned — the frontend
-    executes them client-side and adds the real ToolMessage on the next run.
-    patch_orphan_tool_calls would inject fake error ToolMessages that conflict
-    with the real results.
-
-    Orphaned tool_calls are instead handled at merge time in
-    ActorAwareLangGraphAgent.langgraph_default_merge_state.
-    """
-
-    def __init__(self, original_processor):
-        self._original = original_processor
-
-    def process_events(self, events):
-        return self._original.process_events(events)
-
-    def build_checkpoint_tuple(self, checkpoint_event, writes, channel_data, config):
-        pending_writes = [
-            (write.task_id, write.channel, write.value) for write in writes
-        ]
-        parent_config = None
-        if checkpoint_event.parent_checkpoint_id:
-            parent_config = {
-                "configurable": {
-                    "thread_id": config.thread_id,
-                    "actor_id": config.actor_id,
-                    "checkpoint_ns": config.checkpoint_ns,
-                    "checkpoint_id": checkpoint_event.parent_checkpoint_id,
-                }
-            }
-
-        checkpoint = checkpoint_event.checkpoint_data.copy()
-        channel_values = {}
-        for channel, version in checkpoint.get("channel_versions", {}).items():
-            if (channel, version) in channel_data:
-                channel_values[channel] = channel_data[(channel, version)]
-
-        # NOTE: We intentionally skip patch_orphan_tool_calls here.
-        # Orphaned frontend tool_calls are handled in langgraph_default_merge_state
-        # by filtering stray ToolMessages instead.
-
-        checkpoint["channel_values"] = channel_values
-
-        return CheckpointTuple(
-            config={
-                "configurable": {
-                    "thread_id": config.thread_id,
-                    "actor_id": config.actor_id,
-                    "checkpoint_ns": config.checkpoint_ns,
-                    "checkpoint_id": checkpoint_event.checkpoint_id,
-                }
-            },
-            checkpoint=checkpoint,
-            metadata=checkpoint_event.metadata,
-            parent_config=parent_config,
-            pending_writes=pending_writes,
-        )
-
-
-class CopilotKitMemorySaver(AgentCoreMemorySaver):
-    """AgentCoreMemorySaver that skips patch_orphan_tool_calls entirely."""
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.processor = _NoPatchEventProcessor(self.processor)
-
-
-def _build_checkpointer() -> CopilotKitMemorySaver:
+def _build_checkpointer() -> AgentCoreMemorySaver:
     memory_id = os.environ.get("MEMORY_ID")
     if not memory_id:
         raise ValueError("MEMORY_ID environment variable is required")

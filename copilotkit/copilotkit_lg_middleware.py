@@ -15,12 +15,9 @@ Example:
 """
 
 import json
-import logging
 from typing import Any, Callable, Awaitable, ClassVar, List
 
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
-
-_mw_log = logging.getLogger("copilotkit.middleware")
 from langchain.agents.middleware import (
     AgentMiddleware,
     AgentState,
@@ -113,7 +110,6 @@ class CopilotKitMiddleware(AgentMiddleware[StateSchema, Any]):
             unanswered = [tc for tc in tool_calls if tc.get('id') not in answered_tc_ids]
             if unanswered:
                 unanswered_ids = {tc['id'] for tc in unanswered}
-                print(f"[MW] stripping {len(unanswered)} unanswered tool_calls: {list(unanswered_ids)}", flush=True)
                 msg.tool_calls = [tc for tc in tool_calls if tc.get('id') in answered_tc_ids]
 
                 # Also strip matching content blocks
@@ -153,24 +149,7 @@ class CopilotKitMiddleware(AgentMiddleware[StateSchema, Any]):
             request: ModelRequest,
             handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
     ) -> ModelResponse:
-        # Log message structure before fix (use print for guaranteed output)
-        import sys
-        for i, msg in enumerate(request.messages):
-            tc = getattr(msg, 'tool_calls', None) or []
-            tcid = getattr(msg, 'tool_call_id', None)
-            content_blocks = ''
-            if isinstance(getattr(msg, 'content', None), list):
-                content_blocks = [(b.get('type'), b.get('id')) if isinstance(b, dict) else type(b).__name__ for b in msg.content]
-            print(f"[MW-PRE] msg[{i}] {type(msg).__name__} id={getattr(msg, 'id', None)} tc_ids={[t.get('id') for t in tc]} tcid={tcid} content_blocks={content_blocks}", flush=True, file=sys.stderr)
-
-        # Fix checkpoint messages before they reach Bedrock
         self._fix_messages_for_bedrock(request.messages)
-
-        # Log after fix
-        for i, msg in enumerate(request.messages):
-            tc = getattr(msg, 'tool_calls', None) or []
-            tcid = getattr(msg, 'tool_call_id', None)
-            print(f"[MW-POST] msg[{i}] {type(msg).__name__} tc_ids={[t.get('id') for t in tc]} tcid={tcid}", flush=True, file=sys.stderr)
 
         frontend_tools = request.state.get("copilotkit", {}).get("actions", [])
 
