@@ -1,10 +1,11 @@
 # LangGraph agent dependencies with pinned versions
 fastapi==0.115.12
 uvicorn==0.34.2
-ag-ui-langgraph==0.0.25
+ag-ui-protocol>=0.1.10
 partialjson>=0.0.8
 toml>=0.10.2
 langgraph==1.0.8
+langchain>=0.3.0
 langchain-aws==1.0.0
 langchain-mcp-adapters==0.1.13
 langgraph-checkpoint-aws==1.0.5

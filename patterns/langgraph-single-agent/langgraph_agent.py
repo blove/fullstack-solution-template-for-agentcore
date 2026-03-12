@@ -17,17 +17,24 @@ from typing import Any, Literal, TypedDict, cast
 
 
 # Fix CopilotKit + Bedrock Converse API compatibility:
-# Orphaned ToolMessages (e.g. frontend tool results sent on follow-up) that
-# have no matching tool_call in any AIMessage must be stripped
+# 1. Sync content blocks with tool_calls (CopilotKit after_model strips tool_calls)
+# 2. Reorder ToolMessages to sit right after their parent AIMessage (Bedrock requires it)
+# 3. Strip orphaned ToolMessages and unanswered tool_calls
 try:
     import langchain_aws.chat_models.bedrock_converse as _bc
     from langchain_core.messages import AIMessage as _AIMessage, ToolMessage as _ToolMessage
 
     _orig_messages_to_bedrock = _bc._messages_to_bedrock
+    _patch_log = logging.getLogger("bedrock_patch")
 
     def _patched_messages_to_bedrock(messages):
-        # Sync content with tool_calls: remove tool_use content blocks that
-        # aren't in msg.tool_calls (stripped by CopilotKit after_model).
+        _patch_log.info("[PATCH] input messages: %s",
+                        [(type(m).__name__, m.id,
+                          getattr(m, "tool_call_id", None) or [tc["id"] for tc in getattr(m, "tool_calls", []) or []])
+                         for m in messages])
+
+        # 1. Sync content with tool_calls: remove tool_use content blocks that
+        #    aren't in msg.tool_calls (stripped by CopilotKit after_model).
         for msg in messages:
             if isinstance(msg, _AIMessage) and isinstance(msg.content, list):
                 tc_ids = {tc["id"] for tc in (msg.tool_calls or [])}
@@ -37,26 +44,43 @@ try:
                             and block.get("id") not in tc_ids)
                 ]
 
-        # Collect ALL valid tool_call IDs from all AIMessages (both tool_calls
-        # list and content tool_use blocks). Any ToolMessage whose tool_call_id
-        # isn't in this set is orphaned and would cause Bedrock to reject with
-        # "toolResult blocks exceeds toolUse blocks of previous turn".
-        all_tc_ids = set()
-        for msg in messages:
+        # 2. Pull out all ToolMessages, then rebuild the list inserting each
+        #    ToolMessage right after the AIMessage that owns its tool_call_id.
+        tool_msgs = {m.tool_call_id: m for m in messages if isinstance(m, _ToolMessage)}
+        non_tool = [m for m in messages if not isinstance(m, _ToolMessage)]
+        reordered = []
+        answered_tc_ids = set()
+        for msg in non_tool:
+            reordered.append(msg)
             if isinstance(msg, _AIMessage):
                 for tc in (msg.tool_calls or []):
-                    all_tc_ids.add(tc["id"])
-                if isinstance(msg.content, list):
-                    for block in msg.content:
-                        if isinstance(block, dict) and block.get("type") == "tool_use":
-                            all_tc_ids.add(block.get("id"))
+                    if tc["id"] in tool_msgs:
+                        reordered.append(tool_msgs[tc["id"]])
+                        answered_tc_ids.add(tc["id"])
 
-        messages = [
-            msg for msg in messages
-            if not (isinstance(msg, _ToolMessage) and msg.tool_call_id not in all_tc_ids)
-        ]
+        # 3. Strip unanswered tool_calls from AIMessages (frontend tools with no
+        #    ToolMessage yet — Bedrock rejects toolUse without matching toolResult).
+        for msg in reordered:
+            if isinstance(msg, _AIMessage) and msg.tool_calls:
+                unanswered = [tc for tc in msg.tool_calls if tc["id"] not in answered_tc_ids]
+                if unanswered:
+                    _patch_log.info("[PATCH] stripping %d unanswered tool_calls: %s",
+                                   len(unanswered), [tc["id"] for tc in unanswered])
+                    msg.tool_calls = [tc for tc in msg.tool_calls if tc["id"] in answered_tc_ids]
+                    if isinstance(msg.content, list):
+                        unanswered_ids = {tc["id"] for tc in unanswered}
+                        msg.content = [
+                            block for block in msg.content
+                            if not (isinstance(block, dict) and block.get("type") == "tool_use"
+                                    and block.get("id") in unanswered_ids)
+                        ]
 
-        result = _orig_messages_to_bedrock(messages)
+        _patch_log.info("[PATCH] reordered messages: %s",
+                        [(type(m).__name__, m.id,
+                          getattr(m, "tool_call_id", None) or [tc["id"] for tc in getattr(m, "tool_calls", []) or []])
+                         for m in reordered])
+
+        result = _orig_messages_to_bedrock(reordered)
         # Fix string toolUse.input values from streaming (stored in checkpoints)
         for bedrock_msg in result[0]:
             for block in bedrock_msg.get("content", []):
@@ -328,111 +352,6 @@ class ActorAwareLangGraphAgent(LangGraphAGUIAgent):
         logger.info("[AGUI] using add_langgraph_fastapi_endpoint path, actor_id=%s", actor_id)
         async for event in super().run(input):
             yield event
-
-    def langgraph_default_merge_state(
-        self, state: dict[str, Any], messages: list[Any], input: RunAgentInput
-    ) -> dict[str, Any]:
-        merged_state = super().langgraph_default_merge_state(state, messages, input)
-
-        # Fix orphaned frontend tool_calls in checkpoint AIMessages.
-        # CopilotKit middleware restores frontend tool_calls (e.g. enableAppMode)
-        # to AIMessages after the run but doesn't add ToolMessages. On follow-up
-        # requests the frontend sends ToolMessages for these, which get appended
-        # at the wrong position causing Bedrock API errors.
-        #
-        # Strategy: strip orphaned tool_calls from checkpoint AIMessages and
-        # filter their stray ToolMessages from new messages. However, if the
-        # AIMessage is at the TAIL of the checkpoint (no non-ToolMessage messages
-        # after it), an incoming ToolMessage can be safely appended — so we
-        # keep those tool_calls to avoid breaking the continuation loop for
-        # frontend tools like show_pie_chart.
-        checkpoint_messages = state.get("messages", [])
-        new_messages = merged_state.get("messages", [])
-
-        checkpoint_tool_result_ids = {
-            msg.tool_call_id
-            for msg in checkpoint_messages
-            if isinstance(msg, ToolMessage)
-        }
-        new_tool_result_ids = {
-            msg.tool_call_id
-            for msg in new_messages
-            if isinstance(msg, ToolMessage)
-        }
-
-        orphan_tool_call_ids: set[str] = set()
-        replacement_ai_messages: list[AIMessage] = []
-        for idx, msg in enumerate(checkpoint_messages):
-            if not (isinstance(msg, AIMessage) and msg.tool_calls):
-                continue
-
-            # Find tool_calls with no ToolMessage in the checkpoint
-            unmatched = {
-                tc["id"] for tc in msg.tool_calls
-                if tc["id"] not in checkpoint_tool_result_ids
-            }
-            if not unmatched:
-                continue
-
-            # Can we safely append ToolMessages after this AIMessage?
-            # Only if there are no non-ToolMessage messages after it
-            # (ToolMessages for THIS AIMessage's tool_calls are OK).
-            ai_tc_ids = {tc["id"] for tc in msg.tool_calls}
-            can_append = True
-            for later in checkpoint_messages[idx + 1:]:
-                if isinstance(later, ToolMessage) and later.tool_call_id in ai_tc_ids:
-                    continue
-                can_append = False
-                break
-
-            if can_append:
-                # Only strip unmatched tool_calls that have NO incoming ToolMessage
-                to_strip = unmatched - new_tool_result_ids
-            else:
-                # Can't append at the right position — strip ALL unmatched
-                to_strip = unmatched
-
-            if to_strip:
-                orphan_tool_call_ids.update(to_strip)
-                kept = [tc for tc in msg.tool_calls if tc["id"] not in to_strip]
-                new_content = msg.content
-                if isinstance(new_content, list):
-                    new_content = [
-                        block for block in new_content
-                        if not (
-                            isinstance(block, dict)
-                            and block.get("type") == "tool_use"
-                            and block.get("id") in to_strip
-                        )
-                    ]
-                replacement_ai_messages.append(
-                    msg.model_copy(update={
-                        "tool_calls": kept,
-                        "content": new_content,
-                    })
-                )
-
-        if orphan_tool_call_ids:
-            filtered = list(replacement_ai_messages)
-            for msg in new_messages:
-                if isinstance(msg, ToolMessage) and msg.tool_call_id in orphan_tool_call_ids:
-                    continue
-                filtered.append(msg)
-            merged_state["messages"] = filtered
-        # else: no orphans, pass through new_messages unchanged
-
-        tools = merged_state.get("tools", [])
-        copilotkit_state = merged_state.get("copilotkit", {})
-        if not isinstance(copilotkit_state, dict):
-            copilotkit_state = {}
-
-        # CopilotKitMiddleware expects frontend tools under state.copilotkit.actions.
-        merged_state["copilotkit"] = {
-            **copilotkit_state,
-            "actions": tools,
-            "context": input.context or [],
-        }
-        return merged_state
 
     async def get_checkpoint_before_message(self, message_id: str, thread_id: str):
         if not thread_id:
