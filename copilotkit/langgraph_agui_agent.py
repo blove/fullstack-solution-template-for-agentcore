@@ -1,9 +1,7 @@
 import json
-import logging
 from typing import Dict, Any, List, Optional, Union, AsyncGenerator
 from enum import Enum
 from ag_ui_langgraph import LangGraphAgent
-from langchain_core.messages import AIMessage, ToolMessage
 from ag_ui.core import (
     EventType,
     CustomEvent,
@@ -192,45 +190,8 @@ class LangGraphAGUIAgent(LangGraphAgent):
             yield event_str
 
     def langgraph_default_merge_state(self, state: State, messages: List[BaseMessage], input: Any) -> State:
-        """Override to add CopilotKit actions and fix ToolMessage ordering for Bedrock."""
-        _log = logging.getLogger("copilotkit.merge")
-
-        # state["messages"] has the existing checkpoint messages.
-        # super() returns {"messages": new_messages, ...} — only messages not in existing.
-        existing_messages = state.get("messages", [])
+        """Override to add CopilotKit actions to the state"""
         merged_state = super().langgraph_default_merge_state(state, messages, input)
-        new_messages = merged_state.get("messages", [])
-
-        _log.info("[MERGE] existing=%d, new=%d", len(existing_messages), len(new_messages))
-        for m in new_messages:
-            _log.info("[MERGE]   new: %s id=%s tc=%s", type(m).__name__, m.id,
-                      getattr(m, "tool_call_id", None) or getattr(m, "tool_calls", None))
-
-        # Collect new ToolMessages that belong to tool_calls in existing AIMessages.
-        # These must be inserted right after their parent AIMessage (Bedrock requires it).
-        pending = {m.tool_call_id: m for m in new_messages if isinstance(m, ToolMessage)}
-        if pending:
-            all_existing_tc_ids = set()
-            for msg in existing_messages:
-                if isinstance(msg, AIMessage):
-                    for tc in (msg.tool_calls or []):
-                        all_existing_tc_ids.add(tc["id"])
-
-            # Walk existing messages backwards, insert matching ToolMessages after parent AI
-            for i in range(len(existing_messages) - 1, -1, -1):
-                if isinstance(existing_messages[i], AIMessage):
-                    for tc in reversed(existing_messages[i].tool_calls or []):
-                        if tc["id"] in pending:
-                            _log.info("[MERGE] inserting ToolMessage for tc=%s after existing[%d]", tc["id"], i)
-                            existing_messages.insert(i + 1, pending.pop(tc["id"]))
-
-            # Remove inserted ToolMessages from new_messages (they're now in existing)
-            new_messages = [m for m in new_messages
-                           if not (isinstance(m, ToolMessage) and m.tool_call_id not in pending)]
-            merged_state = {**merged_state, "messages": new_messages}
-
-        _log.info("[MERGE] result: new_messages=%d, existing=%d", len(new_messages), len(existing_messages))
-
         # Extract tools from the merged state and add them as CopilotKit actions
         agui_properties = merged_state.get('ag-ui', {}) or merged_state
 

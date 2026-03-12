@@ -340,6 +340,23 @@ class ActorAwareLangGraphAgent(LangGraphAGUIAgent):
         current = self.messages_in_process.get(run_id) or {}
         self.messages_in_process[run_id] = {**current, **data}
 
+    def langgraph_default_merge_state(
+        self, state: dict[str, Any], messages: list[Any], input: RunAgentInput
+    ) -> dict[str, Any]:
+        merged_state = super().langgraph_default_merge_state(state, messages, input)
+        tools = merged_state.get("tools", [])
+        copilotkit_state = merged_state.get("copilotkit", {})
+        if not isinstance(copilotkit_state, dict):
+            copilotkit_state = {}
+
+        # CopilotKitMiddleware expects frontend tools under state.copilotkit.actions.
+        merged_state["copilotkit"] = {
+            **copilotkit_state,
+            "actions": tools,
+            "context": input.context or [],
+        }
+        return merged_state
+
     async def run(self, input: RunAgentInput):
         """Inject actor_id from forwarded_props into config per-request."""
         actor_id = resolve_actor_id(input, None)
